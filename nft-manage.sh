@@ -12,8 +12,32 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# 网络接口配置（可以根据需要修改）
-WAN_IFACE="eth0"  # 外网接口
+# 自动检测默认路由接口
+detect_wan_interface() {
+    # 尝试多种方法检测外网接口
+    local iface
+    
+    # 方法1: 通过默认路由检测
+    iface=$(ip route show default 2>/dev/null | awk '/default/ {print $5}')
+    
+    # 方法2: 通过非lo接口检测
+    if [ -z "$iface" ]; then
+        iface=$(ip link show | grep -E "^[0-9]+:" | grep -v "lo:" | awk -F: '{print $2}' | tr -d ' ' | head -1)
+    fi
+    
+    # 方法3: 通过网络配置文件检测
+    if [ -z "$iface" ]; then
+        if [ -f /etc/netplan/*.yaml ]; then
+            iface=$(grep -r "eth\|ens\|enp" /etc/netplan/ | head -1 | awk '{print $2}' | tr -d ':')
+        fi
+    fi
+    
+    # 默认回退到eth0
+    echo "${iface:-eth0}"
+}
+
+# 网络接口配置
+WAN_IFACE=$(detect_wan_interface)
 
 # 检查root权限
 check_root() {
