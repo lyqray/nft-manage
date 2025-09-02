@@ -12,6 +12,144 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
+# 检查root权限
+check_root() {
+    if [ "$EUID" -ne 0 ]; then
+        echo -e "${RED}请使用sudo运行此脚本${NC}"
+        exit 1
+    fi
+}
+
+# 检测Linux发行版
+detect_distro() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        echo "$ID"
+    elif [ -f /etc/alpine-release ]; then
+        echo "alpine"
+    else
+        # 回退到包管理器检测
+        if command -v apt &> /dev/null; then
+            echo "debian"
+        elif command -v yum &> /dev/null; then
+            echo "centos"
+        elif command -v dnf &> /dev/null; then
+            echo "fedora"
+        elif command -v zypper &> /dev/null; then
+            echo "opensuse"
+        elif command -v pacman &> /dev/null; then
+            echo "arch"
+        elif command -v apk &> /dev/null; then
+            echo "alpine"
+        else
+            echo "unknown"
+        fi
+    fi
+}
+
+# 检测nftables是否安装
+check_nft_installed() {
+    if ! command -v nft &> /dev/null; then
+        echo -e "${RED}nftables 未安装${NC}"
+        local distro=$(detect_distro)
+        echo -e "${YELLOW}检测到系统: $distro${NC}"
+        
+        read -p "是否安装 nftables？(y/N): " install_choice
+        
+        if [[ "$install_choice" == "y" || "$install_choice" == "Y" ]]; then
+            install_nftables "$distro"
+        else
+            echo -e "${RED}脚本需要 nftables 才能运行，退出${NC}"
+            exit 1
+        fi
+    else
+        echo -e "${GREEN}nftables 已安装${NC}"
+    fi
+}
+
+# 安装nftables
+install_nftables() {
+    local distro="$1"
+    echo -e "${YELLOW}正在安装 nftables...${NC}"
+    
+    case "$distro" in
+        debian|ubuntu)
+            apt-get update
+            apt-get install -y nftables
+            ;;
+        centos|rhel|rocky|almalinux)
+            if command -v dnf &> /dev/null; then
+                dnf install -y nftables
+            else
+                yum install -y nftables
+            fi
+            ;;
+        fedora)
+            dnf install -y nftables
+            ;;
+        opensuse*|suse)
+            zypper install -y nftables
+            ;;
+        arch|manjaro)
+            pacman -S --noconfirm nftables
+            ;;
+        alpine)
+            apk update
+            apk add nftables
+            ;;
+        *)
+            echo -e "${RED}无法自动识别系统类型${NC}"
+            echo -e "${YELLOW}请尝试手动安装 nftables：${NC}"
+            echo "Debian/Ubuntu: apt install nftables"
+            echo "CentOS/RHEL: yum install nftables"
+            echo "Fedora: dnf install nftables"
+            echo "openSUSE: zypper install nftables"
+            echo "Arch Linux: pacman -S nftables"
+            echo "Alpine Linux: apk add nftables"
+            exit 1
+            ;;
+    esac
+    
+    # 检查安装是否成功
+    if command -v nft &> /dev/null; then
+        echo -e "${GREEN}nftables 安装成功${NC}"
+        
+        # 智能服务管理
+        if command -v systemctl &> /dev/null; then
+            systemctl enable nftables --now 2>/dev/null && \
+            echo -e "${GREEN}nftables 服务已启用并启动 (systemd)${NC}"
+        elif command -v rc-update &> /dev/null; then
+            rc-update add nftables default 2>/dev/null
+            rc-service nftables start 2>/dev/null && \
+            echo -e "${GREEN}nftables 服务已启用并启动 (OpenRC)${NC}"
+        elif [ -f /etc/init.d/nftables ]; then
+            /etc/init.d/nftables start && \
+            echo -e "${GREEN}nftables 服务已启动 (init.d)${NC}"
+        else
+            echo -e "${YELLOW}无法自动启动服务，请手动启动 nftables${NC}"
+        fi
+    else
+        echo -e "${RED}nftables 安装失败${NC}"
+        exit 1
+    fi
+}
+
+# Alpine Linux 特定的配置检查
+check_alpine_config() {
+    if [ -f /etc/alpine-release ] && command -v rc-update &> /dev/null; then
+        echo -e "${BLUE}检测到 Alpine Linux${NC}"
+        
+        if ! rc-update show | grep -q nftables; then
+            echo -e "${YELLOW}nftables 未添加到默认运行级别${NC}"
+            read -p "是否要添加 nftables 到默认运行级别？(y/N): " alpine_choice
+            if [[ "$alpine_choice" == "y" || "$alpine_choice" == "Y" ]]; then
+                rc-update add nftables default
+                echo -e "${GREEN}nftables 已添加到默认运行级别${NC}"
+            fi
+        fi
+    fi
+}
+
 # 自动检测默认路由接口
 detect_wan_interface() {
     # 尝试多种方法检测外网接口
@@ -38,14 +176,6 @@ detect_wan_interface() {
 
 # 网络接口配置
 WAN_IFACE=$(detect_wan_interface)
-
-# 检查root权限
-check_root() {
-    if [ "$EUID" -ne 0 ]; then
-        echo -e "${RED}请使用sudo运行此脚本${NC}"
-        exit 1
-    fi
-}
 
 # 验证端口格式（支持单个端口和端口范围）
 validate_port() {
@@ -269,7 +399,7 @@ clear_all_rules() {
 add_port_forward() {
     echo -e "${YELLOW}添加端口转发${NC}"
     echo -e "${BLUE}提示: 按回车默认使用本地转发(127.0.0.1)${NC}"
-    echo -e "${BLuce}支持单个端口(80)或端口范围(1000-2000)${NC}"
+    echo -e "${BLUE}支持单个端口(80)或端口范围(1000-2000)${NC}"
     read -p "请输入外部端口: " ext_port
     read -p "请输入目标IP(默认127.0.0.1): " target_ip
     target_ip=${target_ip:-127.0.0.1}
@@ -459,7 +589,7 @@ list_all_rules() {
         done
         
         if [ $has_access_rules -eq 0 ]; then
-        echo -e "${YELLOW}无端口访问控制规则${NC}"
+            echo -e "${YELLOW}无端口访问控制规则${NC}"
         fi
         
     else
@@ -495,15 +625,34 @@ reload_rules() {
 
 # 添加nft自启（防止重启失效）
 enable_autostart() {
-    if systemctl enable nftables 2>/dev/null; then
-        echo -e "${GREEN}nftables开机自启已启用${NC}"
-        echo -e "${BLUE}可以使用以下命令管理:${NC}"
+    if command -v systemctl &> /dev/null; then
+        if systemctl enable nftables 2>/dev/null; then
+            echo -e "${GREEN}nftables开机自启已启用 (systemd)${NC}"
+        else
+            echo -e "${RED}启用开机自启失败${NC}"
+        fi
+    elif command -v rc-update &> /dev/null; then
+        # Alpine Linux (OpenRC)
+        if rc-update add nftables default 2>/dev/null; then
+            echo -e "${GREEN}nftables开机自启已启用 (OpenRC)${NC}"
+        else
+            echo -e "${RED}启用开机自启失败${NC}"
+        fi
+    else
+        echo -e "${YELLOW}无法确定init系统，请手动设置开机自启${NC}"
+    fi
+    
+    echo -e "${BLUE}可以使用以下命令管理:${NC}"
+    if command -v systemctl &> /dev/null; then
         echo "systemctl status nftables  # 查看状态"
         echo "systemctl disable nftables # 禁用自启"
         echo "systemctl start nftables   # 启动服务"
         echo "systemctl stop nftables    # 停止服务"
-    else
-        echo -e "${RED}启用开机自启失败${NC}"
+    elif command -v rc-update &> /dev/null; then
+        echo "rc-service nftables status  # 查看状态"
+        echo "rc-update del nftables      # 禁用自启"
+        echo "rc-service nftables start   # 启动服务"
+        echo "rc-service nftables stop    # 停止服务"
     fi
 }
 
@@ -527,6 +676,8 @@ show_menu() {
 # 主循环
 main() {
     check_root
+    check_nft_installed
+    check_alpine_config
     create_config_structure
     
     while true; do
