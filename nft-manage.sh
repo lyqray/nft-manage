@@ -446,15 +446,55 @@ delete_port_forward() {
         return 1
     fi
     
-    # 从文件中删除相关规则
-    delete_rule_from_file "dport ${ext_port}.*dnat"
-    delete_rule_from_file "dport ${ext_port}.*masquerade"
-    delete_rule_from_file "ip daddr.*dport ${ext_port}"
+    # 首先获取目标IP和端口信息，用于删除对应的masquerade规则
+    local target_info=""
+    if [ -f "$SCRIPT_RULES_FILE" ]; then
+        target_info=$(awk -v port="$ext_port" -v proto="$protocol" '
+        /chain prerouting {/,/^    }/ {
+            if ($0 ~ "dport " port ".*dnat to") {
+                # 提取目标IP和端口
+                for (i=1; i<=NF; i++) {
+                    if ($i == "to") {
+                        target = $(i+1)
+                        gsub(/;$/, "", target)
+                        print target
+                        break
+                    }
+                }
+            }
+        }' "$SCRIPT_RULES_FILE")
+    fi
+    
+    echo -e "${BLUE}正在删除端口转发规则...${NC}"
+    
+    # 从文件中删除prerouting链的DNAT规则
+    delete_rule_from_file "dport ${ext_port}.*dnat to"
+    delete_rule_from_file "ip protocol ${protocol} ${protocol} dport ${ext_port}.*dnat"
+    
+    # 删除postrouting链的masquerade规则
+    if [ -n "$target_info" ]; then
+        # 如果有目标信息，删除对应的masquerade规则
+        local target_ip=$(echo "$target_info" | cut -d: -f1)
+        local target_port=$(echo "$target_info" | cut -d: -f2)
+        
+        echo -e "${BLUE}删除目标地址 ${target_ip}:${target_port} 的masquerade规则${NC}"
+        delete_rule_from_file "ip daddr ${target_ip} ${protocol} dport ${target_port}.*masquerade"
+        delete_rule_from_file "daddr ${target_ip}.*dport ${target_port}.*masquerade"
+    else
+        # 如果没有目标信息，使用更通用的模式删除
+        echo -e "${YELLOW}无法获取目标信息，使用通用模式删除masquerade规则${NC}"
+        delete_rule_from_file "dport ${ext_port}.*masquerade"
+        delete_rule_from_file "ip daddr.*dport ${ext_port}.*masquerade"
+    fi
     
     # 重新加载规则文件
     apply_rules_file
     
     echo -e "${GREEN}已删除端口 ${ext_port}/${protocol} 的转发规则${NC}"
+    
+    # 显示剩余的端口转发规则
+    local remaining_rules=$(grep -c "dport.*dnat" "$SCRIPT_RULES_FILE" 2>/dev/null || echo "0")
+    echo -e "${BLUE}剩余端口转发规则: ${remaining_rules} 条${NC}"
 }
 
 # 允许端口访问
