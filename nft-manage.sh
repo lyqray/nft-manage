@@ -539,13 +539,148 @@ delete_port_forward() {
     fi
 }
 
-# 允许入站
+# 验证IP地址格式
+validate_ip() {
+    local ip="$1"
+    
+    # IPv4验证
+    if [[ "$ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+        return 0
+    fi
+    
+    # IPv6验证（简化版，支持压缩格式）
+    if [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] && [[ "$ip" =~ : ]]; then
+        return 0
+    fi
+    
+    # CIDR格式验证
+    if [[ "$ip" =~ ^[0-9a-fA-F:\.]+/[0-9]+$ ]]; then
+        return 0
+    fi
+    
+    return 1
+}
+
+# 在规则文件中插入规则（确保允许规则在拒绝规则之前）
+add_rule_to_file_ordered() {
+    local table="$1"
+    local chain="$2"
+    local rule="$3"
+    local rule_type="$4"  # "accept" 或 "drop"
+    
+    local temp_file=$(mktemp)
+    
+    awk -v table="$table" -v chain="$chain" -v new_rule="$rule" -v rule_type="$rule_type" '
+    BEGIN { 
+        in_table = 0
+        in_chain = 0
+        inserted = 0
+        found_first_drop = 0
+    }
+    
+    # 匹配目标表
+    $0 ~ "^table " table " {$" {
+        in_table = 1
+        print $0
+        next
+    }
+    
+    # 表结束
+    in_table && /^}$/ {
+        in_table = 0
+        print $0
+        next
+    }
+    
+    # 在目标表中匹配目标链
+    in_table && $0 ~ "chain " chain " {$" {
+        in_chain = 1
+        print $0
+        next
+    }
+    
+    # 链结束
+    in_table && in_chain && /^    }$/ {
+        # 如果还没有插入，在链结束前插入
+        if (!inserted) {
+            print "        " new_rule
+            inserted = 1
+        }
+        print $0
+        in_chain = 0
+        next
+    }
+    
+    # 在链中：处理accept规则
+    in_table && in_chain && rule_type == "accept" && !inserted {
+        # 如果是accept规则，寻找第一个drop规则并在其之前插入
+        if (/drop/ && !found_first_drop) {
+            print "        " new_rule
+            inserted = 1
+            found_first_drop = 1
+        }
+        print $0
+        next
+    }
+    
+    # 在链中：处理drop规则  
+    in_table && in_chain && rule_type == "drop" && !inserted {
+        # 如果是drop规则，直接打印当前行，会在链结束时插入
+        print $0
+        next
+    }
+    
+    # 默认情况：打印当前行
+    { print $0 }
+    
+    END {
+        if (inserted == 0) {
+            # 这里是AWK的注释，使用#号
+            print "# 警告: 未能插入规则，将在链末尾添加: " new_rule > "/dev/stderr"
+        }
+    }
+    ' "$SCRIPT_RULES_FILE" > "$temp_file"
+    
+    if [ $? -eq 0 ]; then
+        mv "$temp_file" "$SCRIPT_RULES_FILE"
+        echo -e "${GREEN}规则已添加${NC}"
+        return 0
+    else
+        rm -f "$temp_file"
+        echo -e "${RED}添加规则失败${NC}"
+        return 1
+    fi
+}
+
+# 允许入站（修复规则顺序问题）
 allow_port() {
     echo -e "${YELLOW}允许入站${NC}"
     echo -e "${BLUE}支持单个端口(80)或端口范围(1000-2000)${NC}"
+    echo -e "${BLUE}可以指定允许访问的源IP，不输入则允许所有IP${NC}"
+    echo -e "${BLUE}支持IPv4(192.168.1.1)、IPv6(2001:db8::1)和CIDR(192.168.1.0/24)格式${NC}"
+    
     read -p "请输入端口号: " port
     read -p "请输入协议(tcp/udp, 默认tcp): " protocol
     protocol=${protocol:-tcp}
+    
+    # 询问源IP
+    while true; do
+        read -p "请输入允许访问的源IP(不输入则允许所有IP): " source_ip
+        
+        if [ -z "$source_ip" ]; then
+            # 空输入，允许所有IP
+            break
+        elif validate_ip "$source_ip"; then
+            # 有效的IP地址
+            break
+        else
+            echo -e "${RED}错误: IP地址格式不正确${NC}"
+            echo -e "${YELLOW}支持的格式:${NC}"
+            echo -e "  IPv4: 192.168.1.1"
+            echo -e "  IPv6: 2001:db8::1"
+            echo -e "  CIDR: 192.168.1.0/24"
+        fi
+    done
     
     # 验证端口格式
     if ! validate_port "$port"; then
@@ -553,22 +688,75 @@ allow_port() {
         return 1
     fi
     
-    # 添加到规则文件
-    add_rule_to_file "inet script_filter" "input" "ip protocol ${protocol} ${protocol} dport ${port} ct state new accept"
+    # 构建规则
+    local rule=""
+    if [ -n "$source_ip" ]; then
+        # 指定了源IP
+        if [[ "$source_ip" =~ : ]]; then
+            # IPv6地址
+            if [[ "$source_ip" =~ / ]]; then
+                # IPv6 CIDR
+                rule="ip6 saddr ${source_ip} ${protocol} dport ${port} ct state new accept"
+            else
+                # 单个IPv6地址
+                rule="ip6 saddr ${source_ip} ${protocol} dport ${port} ct state new accept"
+            fi
+        else
+            # IPv4地址
+            if [[ "$source_ip" =~ / ]]; then
+                # IPv4 CIDR
+                rule="ip saddr ${source_ip} ${protocol} dport ${port} ct state new accept"
+            else
+                # 单个IPv4地址
+                rule="ip saddr ${source_ip} ${protocol} dport ${port} ct state new accept"
+            fi
+        fi
+        echo -e "${GREEN}已允许来自 ${source_ip} 的端口访问: ${port}/${protocol}${NC}"
+    else
+        # 允许所有IP
+        rule="meta l4proto ${protocol} ${protocol} dport ${port} ct state new accept"
+        echo -e "${GREEN}已允许所有IP访问端口: ${port}/${protocol}${NC}"
+    fi
     
-    # 应用新规则
-    apply_rules_file
-    
-    echo -e "${GREEN}已允许端口: ${port}/${protocol}${NC}"
+    # 使用有序插入（确保allow规则在drop规则之前）
+    if add_rule_to_file_ordered "inet script_filter" "input" "$rule" "accept"; then
+        # 应用新规则
+        apply_rules_file
+    else
+        echo -e "${RED}添加规则失败${NC}"
+        return 1
+    fi
 }
 
-# 拒绝入站
+# 拒绝入站（修复规则顺序问题）
 deny_port() {
     echo -e "${YELLOW}拒绝入站${NC}"
     echo -e "${BLUE}支持单个端口(80)或端口范围(1000-2000)${NC}"
+    echo -e "${BLUE}可以指定拒绝访问的源IP，不输入则拒绝所有IP${NC}"
+    echo -e "${BLUE}支持IPv4(192.168.1.1)、IPv6(2001:db8::1)和CIDR(192.168.1.0/24)格式${NC}"
+    
     read -p "请输入端口号: " port
     read -p "请输入协议(tcp/udp, 默认tcp): " protocol
     protocol=${protocol:-tcp}
+    
+    # 询问源IP
+    while true; do
+        read -p "请输入拒绝访问的源IP(不输入则拒绝所有IP): " source_ip
+        
+        if [ -z "$source_ip" ]; then
+            # 空输入，拒绝所有IP
+            break
+        elif validate_ip "$source_ip"; then
+            # 有效的IP地址
+            break
+        else
+            echo -e "${RED}错误: IP地址格式不正确${NC}"
+            echo -e "${YELLOW}支持的格式:${NC}"
+            echo -e "  IPv4: 192.168.1.1"
+            echo -e "  IPv6: 2001:db8::1"
+            echo -e "  CIDR: 192.168.1.0/24"
+        fi
+    done
     
     # 验证端口格式
     if ! validate_port "$port"; then
@@ -577,24 +765,83 @@ deny_port() {
     fi
     
     # 删除允许规则（如果存在）
-    delete_rule_from_file "dport ${port}.*accept"
+    if [ -n "$source_ip" ]; then
+        # 转义特殊字符用于正则表达式
+        local escaped_ip=$(echo "$source_ip" | sed 's/\./\\./g' | sed 's/:/\\:/g')
+        delete_rule_from_file "saddr ${escaped_ip}.*dport ${port}.*accept"
+    else
+        delete_rule_from_file "dport ${port}.*accept"
+    fi
     
-    # 添加拒绝规则
-    add_rule_to_file "inet script_filter" "input" "ip protocol ${protocol} ${protocol} dport ${port} drop"
+    # 构建规则
+    local rule=""
+    if [ -n "$source_ip" ]; then
+        # 指定了源IP
+        if [[ "$source_ip" =~ : ]]; then
+            # IPv6地址
+            if [[ "$source_ip" =~ / ]]; then
+                # IPv6 CIDR
+                rule="ip6 saddr ${source_ip} ${protocol} dport ${port} drop"
+            else
+                # 单个IPv6地址
+                rule="ip6 saddr ${source_ip} ${protocol} dport ${port} drop"
+            fi
+        else
+            # IPv4地址
+            if [[ "$source_ip" =~ / ]]; then
+                # IPv4 CIDR
+                rule="ip saddr ${source_ip} ${protocol} dport ${port} drop"
+            else
+                # 单个IPv4地址
+                rule="ip saddr ${source_ip} ${protocol} dport ${port} drop"
+            fi
+        fi
+        echo -e "${GREEN}已拒绝来自 ${source_ip} 的端口访问: ${port}/${protocol}${NC}"
+    else
+        # 拒绝所有IP
+        rule="meta l4proto ${protocol} ${protocol} dport ${port} drop"
+        echo -e "${GREEN}已拒绝所有IP访问端口: ${port}/${protocol}${NC}"
+    fi
     
-    # 重新加载规则文件
-    apply_rules_file
-    
-    echo -e "${GREEN}已拒绝端口: ${port}/${protocol}${NC}"
+    # 使用有序插入（确保drop规则在链末尾）
+    if add_rule_to_file_ordered "inet script_filter" "input" "$rule" "drop"; then
+        # 重新加载规则文件
+        apply_rules_file
+    else
+        echo -e "${RED}添加规则失败${NC}"
+        return 1
+    fi
 }
 
-# 删除入站规则（修复版，支持删除拒绝规则）
+# 删除入站规则（增强版，支持IP过滤和IPv6）
 delete_access_rule() {
     echo -e "${YELLOW}删除入站规则${NC}"
     echo -e "${BLUE}支持单个端口(80)或端口范围(1000-2000)${NC}"
+    echo -e "${BLUE}可以指定删除特定IP的规则，不输入则删除该端口的所有规则${NC}"
+    echo -e "${BLUE}支持IPv4(192.168.1.1)、IPv6(2001:db8::1)和CIDR(192.168.1.0/24)格式${NC}"
+    
     read -p "请输入要删除规则的端口: " port
     read -p "请输入协议(tcp/udp, 默认tcp): " protocol
     protocol=${protocol:-tcp}
+    
+    # 询问源IP
+    while true; do
+        read -p "请输入要删除规则的源IP(不输入则删除该端口的所有规则): " source_ip
+        
+        if [ -z "$source_ip" ]; then
+            # 空输入，删除所有规则
+            break
+        elif validate_ip "$source_ip"; then
+            # 有效的IP地址
+            break
+        else
+            echo -e "${RED}错误: IP地址格式不正确${NC}"
+            echo -e "${YELLOW}支持的格式:${NC}"
+            echo -e "  IPv4: 192.168.1.1"
+            echo -e "  IPv6: 2001:db8::1"
+            echo -e "  CIDR: 192.168.1.0/24"
+        fi
+    done
     
     # 验证端口格式
     if ! validate_port "$port"; then
@@ -604,24 +851,41 @@ delete_access_rule() {
     
     echo -e "${BLUE}正在删除端口 ${port}/${protocol} 的入站规则...${NC}"
     
-    # 从文件中删除相关规则（包括允许和拒绝规则）
-    delete_rule_from_file "dport ${port}.*accept"
-    delete_rule_from_file "dport ${port}.*drop"
-    delete_rule_from_file "dport ${port}.*reject"
-    
-    # 删除特定协议的规则
-    delete_rule_from_file "${protocol} dport ${port}.*accept"
-    delete_rule_from_file "${protocol} dport ${port}.*drop"
-    delete_rule_from_file "${protocol} dport ${port}.*reject"
+    if [ -n "$source_ip" ]; then
+        # 转义特殊字符用于正则表达式
+        local escaped_ip=$(echo "$source_ip" | sed 's/\./\\./g' | sed 's/:/\\:/g')
+        
+        # 删除特定IP的规则
+        delete_rule_from_file "saddr ${escaped_ip}.*dport ${port}.*accept"
+        delete_rule_from_file "saddr ${escaped_ip}.*dport ${port}.*drop"
+        delete_rule_from_file "saddr ${escaped_ip}.*dport ${port}.*reject"
+        
+        # 删除特定协议的规则
+        delete_rule_from_file "saddr ${escaped_ip}.*${protocol} dport ${port}.*accept"
+        delete_rule_from_file "saddr ${escaped_ip}.*${protocol} dport ${port}.*drop"
+        delete_rule_from_file "saddr ${escaped_ip}.*${protocol} dport ${port}.*reject"
+        
+        echo -e "${GREEN}已删除来自 ${source_ip} 的端口 ${port}/${protocol} 的入站规则${NC}"
+    else
+        # 删除该端口的所有规则
+        delete_rule_from_file "dport ${port}.*accept"
+        delete_rule_from_file "dport ${port}.*drop"
+        delete_rule_from_file "dport ${port}.*reject"
+        
+        # 删除特定协议的规则
+        delete_rule_from_file "${protocol} dport ${port}.*accept"
+        delete_rule_from_file "${protocol} dport ${port}.*drop"
+        delete_rule_from_file "${protocol} dport ${port}.*reject"
+        
+        echo -e "${GREEN}已删除端口 ${port}/${protocol} 的所有入站规则${NC}"
+    fi
     
     # 重新加载规则文件
     apply_rules_file
-    
-    echo -e "${GREEN}已删除端口 ${port}/${protocol} 的入站规则${NC}"
     echo -e "${BLUE}注意: 删除规则后，该端口的访问将遵循默认策略${NC}"
 }
 
-# 列出所有规则（修复IPv6地址解析）
+# 列出所有规则（增强版，显示IP过滤信息）
 list_all_rules() {
     echo -e "${YELLOW}=== 当前所有脚本管理的规则 ===${NC}"
     
@@ -632,23 +896,47 @@ list_all_rules() {
         
         # 使用专用列表注释显示
         if grep -q "# LIST: " "$SCRIPT_RULES_FILE"; then
-            grep "# LIST: " "$SCRIPT_RULES_FILE" | while read -r line; do
+            while IFS= read -r line; do
                 # 提取列表信息
                 list_info=$(echo "$line" | sed 's/# LIST: //')
                 
-                # 正确解析格式：65524->2401:1fe0::b83:5524
-                ext_port=$(echo "$list_info" | cut -d'-' -f1)
-                target_full=$(echo "$list_info" | cut -d'-' -f2 | sed 's/^>//')
+                # 初始化变量
+                local ext_port=""
+                local target_full=""
+                local target_ip=""
+                local target_port=""
                 
-                # 正确分离目标IP和端口（处理IPv6地址）
-                if [[ "$target_full" =~ :[0-9]+$ ]]; then
-                    # 有端口号的情况
-                    target_ip=$(echo "$target_full" | sed 's/:[0-9]\+$//')
-                    target_port=$(echo "$target_full" | grep -oE '[0-9]+$')
+                # 正确解析端口范围和目标（处理IPv6地址）
+                if [[ "$list_info" =~ ([0-9]+-[0-9]+)-(.+) ]]; then
+                    # 端口范围情况: 4001-4999->target
+                    ext_port="${BASH_REMATCH[1]}"
+                    target_full="${BASH_REMATCH[2]}"
+                elif [[ "$list_info" =~ ([0-9]+)-(.+) ]]; then
+                    # 单个端口情况: 4001->target
+                    ext_port="${BASH_REMATCH[1]}"
+                    target_full="${BASH_REMATCH[2]}"
                 else
-                    # 没有端口号的情况
-                    target_ip="$target_full"
-                    target_port=""
+                    # 无法解析的格式，跳过
+                    continue
+                fi
+                
+                # 解析目标地址和端口（处理IPv6）
+                if [[ "$target_full" =~ ^\[.*\]:([0-9]+)$ ]]; then
+                    # IPv6格式: [address]:port
+                    target_ip=$(echo "$target_full" | sed 's/\[\(.*\)\]:[0-9]\+$/\1/')
+                    target_port=$(echo "$target_full" | sed 's/.*:\([0-9]\+\)$/\1/')
+                elif [[ "$target_full" =~ :([0-9]+)$ ]] && [[ ! "$target_full" =~ ^\[.*\] ]]; then
+                    # IPv4格式: ip:port
+                    target_ip=$(echo "$target_full" | sed 's/:.*//')
+                    target_port=$(echo "$target_full" | sed 's/.*://')
+                elif [[ "$target_full" =~ ^[0-9]+$ ]]; then
+                    # 只有端口号的情况（默认本地）
+                    target_ip="127.0.0.1"
+                    target_port="$target_full"
+                else
+                    # 无法解析的目标格式
+                    target_ip="unknown"
+                    target_port="unknown"
                 fi
                 
                 # 协议从实际规则中获取（默认tcp）
@@ -670,9 +958,17 @@ list_all_rules() {
                     type_label="${GREEN}[远程转发]${NC}"
                 fi
                 
-                echo -e "转发: ${ext_port}/${protocol} -> ${display_target} $type_label $ip_type"
+                # 判断是否为端口范围
+                if [[ "$ext_port" =~ - ]]; then
+                    port_label="端口范围"
+                else
+                    port_label="端口"
+                fi
+                
+                echo -e "${port_label}: ${ext_port}/${protocol} -> ${display_target} $type_label $ip_type"
                 has_rules=1
-            done
+                
+            done < <(grep "# LIST: " "$SCRIPT_RULES_FILE")
         fi
         
         if [ $has_rules -eq 0 ]; then
@@ -681,39 +977,103 @@ list_all_rules() {
         
         echo
         
-        # 显示入站控制规则
+        # 显示入站控制规则（增强版，显示IP信息）
         echo -e "${BLUE}--- 入站控制规则 ---${NC}"
         local has_access_rules=0
         
         # 检查input链中的accept规则（排除注释行）
-        awk '/chain input {/,/^    }/ {if (/accept/ && /dport/ && !/#/) print}' "$SCRIPT_RULES_FILE" | while read -r line; do
+        while IFS= read -r line; do
+            # 支持端口范围匹配
             port=$(echo "$line" | grep -oE "dport [0-9]+(-[0-9]+)?" | awk '{print $2}')
             protocol=$(echo "$line" | grep -oE "tcp|udp")
+            
+            # 检查是否有源IP限制
+            source_ip=""
+            if [[ "$line" =~ saddr[[:space:]]+([0-9a-fA-F\.:]+) ]]; then
+                source_ip="${BASH_REMATCH[1]}"
+            fi
+            
             if [ -n "$port" ]; then
-                echo -e "允许: ${port}/${protocol} ${GREEN}[允许访问]${NC}"
+                if [ -n "$source_ip" ]; then
+                    # 有源IP限制
+                    if [[ "$port" =~ - ]]; then
+                        echo -e "允许: ${port}/${protocol} 来自 ${source_ip} ${GREEN}[允许特定IP - 端口范围]${NC}"
+                    else
+                        echo -e "允许: ${port}/${protocol} 来自 ${source_ip} ${GREEN}[允许特定IP]${NC}"
+                    fi
+                else
+                    # 无源IP限制
+                    if [[ "$port" =~ - ]]; then
+                        echo -e "允许: ${port}/${protocol} ${GREEN}[允许所有IP - 端口范围]${NC}"
+                    else
+                        echo -e "允许: ${port}/${protocol} ${GREEN}[允许所有IP]${NC}"
+                    fi
+                fi
                 has_access_rules=1
             fi
-        done
+        done < <(awk '/chain input {/,/^    }/ {if (/accept/ && /dport/ && !/#/) print}' "$SCRIPT_RULES_FILE")
         
-        # 检查input链中的drop规则（排除注释行）- 新增拒绝规则显示
-        awk '/chain input {/,/^    }/ {if (/drop/ && /dport/ && !/#/) print}' "$SCRIPT_RULES_FILE" | while read -r line; do
+        # 检查input链中的drop规则（排除注释行）
+        while IFS= read -r line; do
             port=$(echo "$line" | grep -oE "dport [0-9]+(-[0-9]+)?" | awk '{print $2}')
             protocol=$(echo "$line" | grep -oE "tcp|udp")
+            
+            # 检查是否有源IP限制
+            source_ip=""
+            if [[ "$line" =~ saddr[[:space:]]+([0-9a-fA-F\.:]+) ]]; then
+                source_ip="${BASH_REMATCH[1]}"
+            fi
+            
             if [ -n "$port" ] && [ -n "$protocol" ]; then
-                echo -e "拒绝: ${port}/${protocol} ${RED}[拒绝访问]${NC}"
+                if [ -n "$source_ip" ]; then
+                    # 有源IP限制
+                    if [[ "$port" =~ - ]]; then
+                        echo -e "拒绝: ${port}/${protocol} 来自 ${source_ip} ${RED}[拒绝特定IP - 端口范围]${NC}"
+                    else
+                        echo -e "拒绝: ${port}/${protocol} 来自 ${source_ip} ${RED}[拒绝特定IP]${NC}"
+                    fi
+                else
+                    # 无源IP限制
+                    if [[ "$port" =~ - ]]; then
+                        echo -e "拒绝: ${port}/${protocol} ${RED}[拒绝所有IP - 端口范围]${NC}"
+                    else
+                        echo -e "拒绝: ${port}/${protocol} ${RED}[拒绝所有IP]${NC}"
+                    fi
+                fi
                 has_access_rules=1
             fi
-        done
+        done < <(awk '/chain input {/,/^    }/ {if (/drop/ && /dport/ && !/#/) print}' "$SCRIPT_RULES_FILE")
         
-        # 检查input链中的reject规则（排除注释行）- 新增拒绝规则显示
-        awk '/chain input {/,/^    }/ {if (/reject/ && /dport/ && !/#/) print}' "$SCRIPT_RULES_FILE" | while read -r line; do
+        # 检查input链中的reject规则（排除注释行）
+        while IFS= read -r line; do
             port=$(echo "$line" | grep -oE "dport [0-9]+(-[0-9]+)?" | awk '{print $2}')
             protocol=$(echo "$line" | grep -oE "tcp|udp")
+            
+            # 检查是否有源IP限制
+            source_ip=""
+            if [[ "$line" =~ saddr[[:space:]]+([0-9a-fA-F\.:]+) ]]; then
+                source_ip="${BASH_REMATCH[1]}"
+            fi
+            
             if [ -n "$port" ] && [ -n "$protocol" ]; then
-                echo -e "拒绝: ${port}/${protocol} ${RED}[拒绝访问]${NC}"
+                if [ -n "$source_ip" ]; then
+                    # 有源IP限制
+                    if [[ "$port" =~ - ]]; then
+                        echo -e "拒绝: ${port}/${protocol} 来自 ${source_ip} ${RED}[拒绝特定IP - 端口范围]${NC}"
+                    else
+                        echo -e "拒绝: ${port}/${protocol} 来自 ${source_ip} ${RED}[拒绝特定IP]${NC}"
+                    fi
+                else
+                    # 无源IP限制
+                    if [[ "$port" =~ - ]]; then
+                        echo -e "拒绝: ${port}/${protocol} ${RED}[拒绝所有IP - 端口范围]${NC}"
+                    else
+                        echo -e "拒绝: ${port}/${protocol} ${RED}[拒绝所有IP]${NC}"
+                    fi
+                fi
                 has_access_rules=1
             fi
-        done
+        done < <(awk '/chain input {/,/^    }/ {if (/reject/ && /dport/ && !/#/) print}' "$SCRIPT_RULES_FILE")
         
         if [ $has_access_rules -eq 0 ]; then
             echo -e "${YELLOW}无入站控制规则${NC}"
