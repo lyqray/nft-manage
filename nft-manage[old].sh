@@ -291,47 +291,56 @@ apply_rules_file() {
     fi
 }
 
-# 在规则文件中添加规则（修复版）
+# 在规则文件中添加规则
 add_rule_to_file() {
     local table="$1"
     local chain="$2"
     local rule="$3"
     
     local temp_file=$(mktemp)
-    local rule_inserted=0
     
-    # 读取文件并插入规则
-    while IFS= read -r line; do
-        echo "$line" >> "$temp_file"
-        
-        # 找到目标链并在其开始大括号后插入规则
-        if [[ "$line" =~ ^[[:space:]]*chain[[:space:]]+$chain[[:space:]]+{[[:space:]]*$ ]] && [[ $rule_inserted -eq 0 ]]; then
-            # 读取下一行（应该是链的内容开始）
-            while IFS= read -r next_line; do
-                echo "$next_line" >> "$temp_file"
-                
-                # 如果遇到规则行（有缩进）或者链的结束，就在之前插入我们的规则
-                if [[ "$next_line" =~ ^[[:space:]]+[^}] ]] || [[ "$next_line" =~ ^[[:space:]]*}[[:space:]]*$ ]]; then
-                    echo "        $rule" >> "$temp_file"
-                    rule_inserted=1
-                    break
-                fi
-            done
-        fi
-    done < "$SCRIPT_RULES_FILE"
+    awk -v table="$table" -v chain="$chain" -v new_rule="$rule" '
+    BEGIN { in_table = 0; in_chain = 0; inserted = 0 }
     
-    # 如果没找到链，在文件末尾添加
-    if [[ $rule_inserted -eq 0 ]]; then
-        echo "# 自动添加的表和链" >> "$temp_file"
-        echo "table $table {" >> "$temp_file"
-        echo "    chain $chain {" >> "$temp_file"
-        echo "        $rule" >> "$temp_file"
-        echo "    }" >> "$temp_file"
-        echo "}" >> "$temp_file"
-        rule_inserted=1
-    fi
+    # 匹配目标表
+    $0 ~ "^table " table " {$" {
+        in_table = 1
+        print $0
+        next
+    }
     
-    if [[ $rule_inserted -eq 1 ]]; then
+    # 在目标表中匹配目标链
+    in_table && $0 ~ "chain " chain " {$" {
+        in_chain = 1
+        print $0
+        next
+    }
+    
+    # 在目标链的结束括号前插入规则
+    in_table && in_chain && /^    }$/ {
+        print "        " new_rule
+        print $0
+        inserted = 1
+        in_chain = 0
+        next
+    }
+    
+    # 表结束
+    in_table && /^}$/ {
+        in_table = 0
+    }
+    
+    { print $0 }
+    
+    END {
+        if (inserted == 0) {
+            print "// 未能插入规则: " new_rule > "/dev/stderr"
+            exit 1
+        }
+    }
+    ' "$SCRIPT_RULES_FILE" > "$temp_file"
+    
+    if [ $? -eq 0 ]; then
         mv "$temp_file" "$SCRIPT_RULES_FILE"
         return 0
     else
@@ -345,7 +354,7 @@ delete_rule_from_file() {
     local pattern="$1"
     if [ -f "$SCRIPT_RULES_FILE" ]; then
         # 使用更精确的匹配，避免误删，保留空行
-        grep -v "$pattern" "$SCRIPT_RULES_FILE" > "${SCRIPT_RULES_FILE}.tmp" && mv "${SCRIPT_RULES_FILE}.tmp" "$SCRIPT_RULES_FILE"
+        sed -i "/${pattern}/d" "$SCRIPT_RULES_FILE"
     fi
 }
 
@@ -361,45 +370,62 @@ clear_all_rules() {
         return
     fi
     
-    # 重新创建基础表结构
-    cat > "$SCRIPT_RULES_FILE" << 'EOF'
-#!/usr/sbin/nft -f
-
-# 脚本管理的表（不影响其他服务）
-table inet script_filter {
-    chain input {
-        type filter hook input priority 10; policy accept;
-    }
-}
-
-table inet script_nat {
-    chain prerouting {
-        type nat hook prerouting priority 10;
+    # 创建临时文件，只保留表结构，删除所有自定义规则
+    local temp_file=$(mktemp)
+    
+    awk '
+    BEGIN { in_table = 0; in_chain = 0 }
+    
+    # 匹配表开始
+    /^table / {
+        in_table = 1
+        print $0
+        next
     }
     
-    chain postrouting {
-        type nat hook postrouting priority 100;
-    }
-}
-
-# 脚本管理的表 - IPv6专用NAT表（不影响其他服务）
-table ip6 script_nat {
-    chain prerouting {
-        type nat hook prerouting priority 0;
+    # 表结束
+    in_table && /^}$/ {
+        in_table = 0
+        print $0
+        next
     }
     
-    chain postrouting {
-        type nat hook postrouting priority 100;
+    # 匹配链开始
+    in_table && /chain [^ ]+ {/ {
+        in_chain = 1
+        print $0
+        next
     }
-}
-EOF
     
-    # 重新应用规则
-    apply_rules_file
-    echo -e "${GREEN}已清空所有脚本管理的规则${NC}"
+    # 链结束
+    in_chain && /^    }$/ {
+        in_chain = 0
+        print $0
+        next
+    }
+    
+    # 跳过所有规则行（保留链定义和表结构）
+    in_chain && /^        [^}]/ && !/type filter hook/ && !/type nat hook/ {
+        # 跳过规则行，但保留hook定义
+        next
+    }
+    
+    { print $0 }
+    ' "$SCRIPT_RULES_FILE" > "$temp_file"
+    
+    if [ $? -eq 0 ]; then
+        mv "$temp_file" "$SCRIPT_RULES_FILE"
+        # 重新应用规则
+        apply_rules_file
+        echo -e "${GREEN}已清空所有脚本管理的规则${NC}"
+        echo -e "${YELLOW}所有脚本添加的端口转发和入站控制规则已被删除${NC}"
+    else
+        rm -f "$temp_file"
+        echo -e "${RED}清空规则失败${NC}"
+    fi
 }
 
-# 添加端口转发（修复IPv6规则语法）
+# 添加端口转发（优化注释版本）
 add_port_forward() {
     echo -e "${YELLOW}添加端口转发${NC}"
     echo -e "${BLUE}提示: 按回车默认使用本地转发(127.0.0.1或::1)${NC}"
@@ -419,14 +445,14 @@ add_port_forward() {
     fi
     
     # 生成唯一的注释标识（用于删除）
-    local delete_comment="comment \"${ext_port}->${target_ip}:${target_port}\""
+    local delete_comment="# ${ext_port}->${target_ip}:${target_port}"
     
     # 生成专用的列表显示注释（简化版）
-    local list_comment="comment \"LIST: ${ext_port}->${target_ip}:${target_port}\""
+    local list_comment="# LIST: ${ext_port}->${target_ip}:${target_port}"
     
     # 判断IP类型并构建正确的nftables规则
     local dnat_rule
-    local snat_rule=""
+    local nat_rule=""
     
     if [[ "$target_ip" =~ : ]]; then
         # IPv6规则 - 获取本机公网IPv6
@@ -440,29 +466,30 @@ add_port_forward() {
             fi
         fi
         
-        # 修复IPv6规则语法
         dnat_rule="tcp dport ${ext_port} dnat to [${target_ip}]:${target_port} ${delete_comment}"
-        snat_rule="oifname \"${WAN_IFACE}\" snat to ${public_ipv6} ${delete_comment}"
+        nat_rule="snat to [${public_ipv6}] ${delete_comment}"
         
         echo -e "${BLUE}检测到IPv6地址，使用IPv6转发规则${NC}"
         
         # 添加到ip6 script_nat表
         if add_rule_to_file "ip6 script_nat" "prerouting" "$dnat_rule"; then
-            add_rule_to_file "ip6 script_nat" "postrouting" "$snat_rule"
-            echo -e "${GREEN}IPv6端口转发规则已添加${NC}"
+            add_rule_to_file "ip6 script_nat" "postrouting" "$nat_rule"
+            # 添加专用列表注释
+            add_rule_to_file "ip6 script_nat" "prerouting" "${list_comment}"
         fi
         
     else
         # IPv4规则
-        dnat_rule="ip protocol ${protocol} ${protocol} dport ${ext_port} dnat to ${target_ip}:${target_port} ${delete_comment}"
-        snat_rule="oifname \"${WAN_IFACE}\" masquerade ${delete_comment}"
+        dnat_rule="ip protocol ${protocol} ${protocol} dport ${ext_port} counter dnat to ${target_ip}:${target_port} ${delete_comment}"
+        nat_rule="ip daddr ${target_ip} ${protocol} dport ${target_port} counter masquerade ${delete_comment}"
         
         echo -e "${BLUE}使用IPv4转发规则${NC}"
         
         # 添加到inet script_nat表
         if add_rule_to_file "inet script_nat" "prerouting" "$dnat_rule"; then
-            add_rule_to_file "inet script_nat" "postrouting" "$snat_rule"
-            echo -e "${GREEN}IPv4端口转发规则已添加${NC}"
+            add_rule_to_file "inet script_nat" "postrouting" "$nat_rule"
+            # 添加专用列表注释
+            add_rule_to_file "inet script_nat" "prerouting" "${list_comment}"
         fi
     fi
     
@@ -479,7 +506,7 @@ add_port_forward() {
     fi
 }
 
-# 删除端口转发（修复注释匹配）
+# 删除端口转发（简化注释匹配）
 delete_port_forward() {
     echo -e "${YELLOW}删除端口转发${NC}"
     read -p "请输入要删除的外部端口: " ext_port
@@ -494,19 +521,13 @@ delete_port_forward() {
     
     echo -e "${BLUE}正在删除端口 ${ext_port}/${protocol} 的转发规则...${NC}"
     
-    # 使用注释模式匹配
-    local pattern="comment.*${ext_port}-"
+    # 简化注释匹配
+    local pattern="${ext_port}->"
     
     # 删除所有包含该注释的规则
     if [ -f "$SCRIPT_RULES_FILE" ]; then
-        # 创建临时文件
-        local temp_file=$(mktemp)
-        
-        # 过滤掉包含目标注释的行
-        grep -v "$pattern" "$SCRIPT_RULES_FILE" > "$temp_file"
-        
-        # 替换原文件
-        mv "$temp_file" "$SCRIPT_RULES_FILE"
+        # 删除转发规则和列表注释
+        sed -i "/${pattern}/d" "$SCRIPT_RULES_FILE"
         
         # 重新应用规则
         apply_rules_file
@@ -540,7 +561,98 @@ validate_ip() {
     return 1
 }
 
-# 允许入站（修复规则语法）
+# 在规则文件中插入规则（确保允许规则在拒绝规则之前）
+add_rule_to_file_ordered() {
+    local table="$1"
+    local chain="$2"
+    local rule="$3"
+    local rule_type="$4"  # "accept" 或 "drop"
+    
+    local temp_file=$(mktemp)
+    
+    awk -v table="$table" -v chain="$chain" -v new_rule="$rule" -v rule_type="$rule_type" '
+    BEGIN { 
+        in_table = 0
+        in_chain = 0
+        inserted = 0
+        found_first_drop = 0
+    }
+    
+    # 匹配目标表
+    $0 ~ "^table " table " {$" {
+        in_table = 1
+        print $0
+        next
+    }
+    
+    # 表结束
+    in_table && /^}$/ {
+        in_table = 0
+        print $0
+        next
+    }
+    
+    # 在目标表中匹配目标链
+    in_table && $0 ~ "chain " chain " {$" {
+        in_chain = 1
+        print $0
+        next
+    }
+    
+    # 链结束
+    in_table && in_chain && /^    }$/ {
+        # 如果还没有插入，在链结束前插入
+        if (!inserted) {
+            print "        " new_rule
+            inserted = 1
+        }
+        print $0
+        in_chain = 0
+        next
+    }
+    
+    # 在链中：处理accept规则
+    in_table && in_chain && rule_type == "accept" && !inserted {
+        # 如果是accept规则，寻找第一个drop规则并在其之前插入
+        if (/drop/ && !found_first_drop) {
+            print "        " new_rule
+            inserted = 1
+            found_first_drop = 1
+        }
+        print $0
+        next
+    }
+    
+    # 在链中：处理drop规则  
+    in_table && in_chain && rule_type == "drop" && !inserted {
+        # 如果是drop规则，直接打印当前行，会在链结束时插入
+        print $0
+        next
+    }
+    
+    # 默认情况：打印当前行
+    { print $0 }
+    
+    END {
+        if (inserted == 0) {
+            # 这里是AWK的注释，使用#号
+            print "# 警告: 未能插入规则，将在链末尾添加: " new_rule > "/dev/stderr"
+        }
+    }
+    ' "$SCRIPT_RULES_FILE" > "$temp_file"
+    
+    if [ $? -eq 0 ]; then
+        mv "$temp_file" "$SCRIPT_RULES_FILE"
+        echo -e "${GREEN}规则已添加${NC}"
+        return 0
+    else
+        rm -f "$temp_file"
+        echo -e "${RED}添加规则失败${NC}"
+        return 1
+    fi
+}
+
+# 允许入站（修复规则顺序问题）
 allow_port() {
     echo -e "${YELLOW}允许入站${NC}"
     echo -e "${BLUE}支持单个端口(80)或端口范围(1000-2000)${NC}"
@@ -558,8 +670,8 @@ allow_port() {
         if [ -z "$source_ip" ]; then
             # 空输入，允许所有IP
             break
-        elif validate_ip "$source_ip" || [[ "$source_ip" == "any" ]]; then
-            # 有效的IP地址或any
+        elif validate_ip "$source_ip"; then
+            # 有效的IP地址
             break
         else
             echo -e "${RED}错误: IP地址格式不正确${NC}"
@@ -567,7 +679,6 @@ allow_port() {
             echo -e "  IPv4: 192.168.1.1"
             echo -e "  IPv6: 2001:db8::1"
             echo -e "  CIDR: 192.168.1.0/24"
-            echo -e "  任意: any"
         fi
     done
     
@@ -577,39 +688,47 @@ allow_port() {
         return 1
     fi
     
-    # 生成注释
-    local rule_comment="comment \"ALLOW: ${port}/${protocol} from ${source_ip:-any}\""
-    
     # 构建规则
     local rule=""
-    if [ -n "$source_ip" ] && [ "$source_ip" != "any" ]; then
+    if [ -n "$source_ip" ]; then
         # 指定了源IP
         if [[ "$source_ip" =~ : ]]; then
             # IPv6地址
-            rule="ip6 saddr ${source_ip} ${protocol} dport ${port} accept ${rule_comment}"
+            if [[ "$source_ip" =~ / ]]; then
+                # IPv6 CIDR
+                rule="ip6 saddr ${source_ip} ${protocol} dport ${port} ct state new accept"
+            else
+                # 单个IPv6地址
+                rule="ip6 saddr ${source_ip} ${protocol} dport ${port} ct state new accept"
+            fi
         else
             # IPv4地址
-            rule="ip saddr ${source_ip} ${protocol} dport ${port} accept ${rule_comment}"
+            if [[ "$source_ip" =~ / ]]; then
+                # IPv4 CIDR
+                rule="ip saddr ${source_ip} ${protocol} dport ${port} ct state new accept"
+            else
+                # 单个IPv4地址
+                rule="ip saddr ${source_ip} ${protocol} dport ${port} ct state new accept"
+            fi
         fi
         echo -e "${GREEN}已允许来自 ${source_ip} 的端口访问: ${port}/${protocol}${NC}"
     else
         # 允许所有IP
-        rule="${protocol} dport ${port} accept ${rule_comment}"
+        rule="meta l4proto ${protocol} ${protocol} dport ${port} ct state new accept"
         echo -e "${GREEN}已允许所有IP访问端口: ${port}/${protocol}${NC}"
     fi
     
-    # 添加到filter表
-    if add_rule_to_file "inet script_filter" "input" "$rule"; then
+    # 使用有序插入（确保allow规则在drop规则之前）
+    if add_rule_to_file_ordered "inet script_filter" "input" "$rule" "accept"; then
         # 应用新规则
         apply_rules_file
-        echo -e "${GREEN}入站规则已添加${NC}"
     else
         echo -e "${RED}添加规则失败${NC}"
         return 1
     fi
 }
 
-# 拒绝入站（修复规则语法）
+# 拒绝入站（修复规则顺序问题）
 deny_port() {
     echo -e "${YELLOW}拒绝入站${NC}"
     echo -e "${BLUE}支持单个端口(80)或端口范围(1000-2000)${NC}"
@@ -627,8 +746,8 @@ deny_port() {
         if [ -z "$source_ip" ]; then
             # 空输入，拒绝所有IP
             break
-        elif validate_ip "$source_ip" || [[ "$source_ip" == "any" ]]; then
-            # 有效的IP地址或any
+        elif validate_ip "$source_ip"; then
+            # 有效的IP地址
             break
         else
             echo -e "${RED}错误: IP地址格式不正确${NC}"
@@ -636,7 +755,6 @@ deny_port() {
             echo -e "  IPv4: 192.168.1.1"
             echo -e "  IPv6: 2001:db8::1"
             echo -e "  CIDR: 192.168.1.0/24"
-            echo -e "  任意: any"
         fi
     done
     
@@ -646,50 +764,84 @@ deny_port() {
         return 1
     fi
     
-    # 生成注释
-    local rule_comment="comment \"DENY: ${port}/${protocol} from ${source_ip:-any}\""
+    # 删除允许规则（如果存在）
+    if [ -n "$source_ip" ]; then
+        # 转义特殊字符用于正则表达式
+        local escaped_ip=$(echo "$source_ip" | sed 's/\./\\./g' | sed 's/:/\\:/g')
+        delete_rule_from_file "saddr ${escaped_ip}.*dport ${port}.*accept"
+    else
+        delete_rule_from_file "dport ${port}.*accept"
+    fi
     
     # 构建规则
     local rule=""
-    if [ -n "$source_ip" ] && [ "$source_ip" != "any" ]; then
+    if [ -n "$source_ip" ]; then
         # 指定了源IP
         if [[ "$source_ip" =~ : ]]; then
             # IPv6地址
-            rule="ip6 saddr ${source_ip} ${protocol} dport ${port} drop ${rule_comment}"
+            if [[ "$source_ip" =~ / ]]; then
+                # IPv6 CIDR
+                rule="ip6 saddr ${source_ip} ${protocol} dport ${port} drop"
+            else
+                # 单个IPv6地址
+                rule="ip6 saddr ${source_ip} ${protocol} dport ${port} drop"
+            fi
         else
             # IPv4地址
-            rule="ip saddr ${source_ip} ${protocol} dport ${port} drop ${rule_comment}"
+            if [[ "$source_ip" =~ / ]]; then
+                # IPv4 CIDR
+                rule="ip saddr ${source_ip} ${protocol} dport ${port} drop"
+            else
+                # 单个IPv4地址
+                rule="ip saddr ${source_ip} ${protocol} dport ${port} drop"
+            fi
         fi
         echo -e "${GREEN}已拒绝来自 ${source_ip} 的端口访问: ${port}/${protocol}${NC}"
     else
         # 拒绝所有IP
-        rule="${protocol} dport ${port} drop ${rule_comment}"
+        rule="meta l4proto ${protocol} ${protocol} dport ${port} drop"
         echo -e "${GREEN}已拒绝所有IP访问端口: ${port}/${protocol}${NC}"
     fi
     
-    # 添加到filter表
-    if add_rule_to_file "inet script_filter" "input" "$rule"; then
-        # 应用新规则
+    # 使用有序插入（确保drop规则在链末尾）
+    if add_rule_to_file_ordered "inet script_filter" "input" "$rule" "drop"; then
+        # 重新加载规则文件
         apply_rules_file
-        echo -e "${GREEN}拒绝规则已添加${NC}"
     else
         echo -e "${RED}添加规则失败${NC}"
         return 1
     fi
 }
 
-# 删除入站规则（修复版）
+# 删除入站规则（增强版，支持IP过滤和IPv6）
 delete_access_rule() {
     echo -e "${YELLOW}删除入站规则${NC}"
     echo -e "${BLUE}支持单个端口(80)或端口范围(1000-2000)${NC}"
     echo -e "${BLUE}可以指定删除特定IP的规则，不输入则删除该端口的所有规则${NC}"
+    echo -e "${BLUE}支持IPv4(192.168.1.1)、IPv6(2001:db8::1)和CIDR(192.168.1.0/24)格式${NC}"
     
     read -p "请输入要删除规则的端口: " port
     read -p "请输入协议(tcp/udp, 默认tcp): " protocol
     protocol=${protocol:-tcp}
     
     # 询问源IP
-    read -p "请输入要删除规则的源IP(不输入则删除该端口的所有规则): " source_ip
+    while true; do
+        read -p "请输入要删除规则的源IP(不输入则删除该端口的所有规则): " source_ip
+        
+        if [ -z "$source_ip" ]; then
+            # 空输入，删除所有规则
+            break
+        elif validate_ip "$source_ip"; then
+            # 有效的IP地址
+            break
+        else
+            echo -e "${RED}错误: IP地址格式不正确${NC}"
+            echo -e "${YELLOW}支持的格式:${NC}"
+            echo -e "  IPv4: 192.168.1.1"
+            echo -e "  IPv6: 2001:db8::1"
+            echo -e "  CIDR: 192.168.1.0/24"
+        fi
+    done
     
     # 验证端口格式
     if ! validate_port "$port"; then
@@ -699,111 +851,229 @@ delete_access_rule() {
     
     echo -e "${BLUE}正在删除端口 ${port}/${protocol} 的入站规则...${NC}"
     
-    # 构建匹配模式
-    local pattern=""
-    if [ -n "$source_ip" ] && [ "$source_ip" != "any" ]; then
+    if [ -n "$source_ip" ]; then
         # 转义特殊字符用于正则表达式
         local escaped_ip=$(echo "$source_ip" | sed 's/\./\\./g' | sed 's/:/\\:/g')
-        pattern="from ${escaped_ip}.*${port}"
+        
+        # 删除特定IP的规则
+        delete_rule_from_file "saddr ${escaped_ip}.*dport ${port}.*accept"
+        delete_rule_from_file "saddr ${escaped_ip}.*dport ${port}.*drop"
+        delete_rule_from_file "saddr ${escaped_ip}.*dport ${port}.*reject"
+        
+        # 删除特定协议的规则
+        delete_rule_from_file "saddr ${escaped_ip}.*${protocol} dport ${port}.*accept"
+        delete_rule_from_file "saddr ${escaped_ip}.*${protocol} dport ${port}.*drop"
+        delete_rule_from_file "saddr ${escaped_ip}.*${protocol} dport ${port}.*reject"
+        
+        echo -e "${GREEN}已删除来自 ${source_ip} 的端口 ${port}/${protocol} 的入站规则${NC}"
     else
-        pattern="dport ${port}"
+        # 删除该端口的所有规则
+        delete_rule_from_file "dport ${port}.*accept"
+        delete_rule_from_file "dport ${port}.*drop"
+        delete_rule_from_file "dport ${port}.*reject"
+        
+        # 删除特定协议的规则
+        delete_rule_from_file "${protocol} dport ${port}.*accept"
+        delete_rule_from_file "${protocol} dport ${port}.*drop"
+        delete_rule_from_file "${protocol} dport ${port}.*reject"
+        
+        echo -e "${GREEN}已删除端口 ${port}/${protocol} 的所有入站规则${NC}"
     fi
     
-    # 删除匹配的规则
-    if [ -f "$SCRIPT_RULES_FILE" ]; then
-        # 创建临时文件
-        local temp_file=$(mktemp)
-        
-        # 过滤掉包含目标模式的行
-        if [ -n "$pattern" ]; then
-            grep -v "$pattern" "$SCRIPT_RULES_FILE" > "$temp_file"
-        else
-            cp "$SCRIPT_RULES_FILE" "$temp_file"
-        fi
-        
-        # 替换原文件
-        mv "$temp_file" "$SCRIPT_RULES_FILE"
-        
-        # 重新应用规则
-        apply_rules_file
-        
-        if [ -n "$source_ip" ]; then
-            echo -e "${GREEN}已删除来自 ${source_ip} 的端口 ${port}/${protocol} 的入站规则${NC}"
-        else
-            echo -e "${GREEN}已删除端口 ${port}/${protocol} 的所有入站规则${NC}"
-        fi
-    else
-        echo -e "${RED}规则文件不存在${NC}"
-        return 1
-    fi
+    # 重新加载规则文件
+    apply_rules_file
+    echo -e "${BLUE}注意: 删除规则后，该端口的访问将遵循默认策略${NC}"
 }
 
-# 列出所有规则（修复版）
+# 列出所有规则（增强版，显示IP过滤信息）
 list_all_rules() {
     echo -e "${YELLOW}=== 当前所有脚本管理的规则 ===${NC}"
     
     if [ -f "$SCRIPT_RULES_FILE" ]; then
-        # 显示端口转发规则
+        # 显示所有端口转发规则
         echo -e "${BLUE}--- 端口转发规则 ---${NC}"
-        local has_forward_rules=0
+        local has_rules=0
         
-        # 检查NAT表中的规则
-        if grep -q "dnat to" "$SCRIPT_RULES_FILE"; then
+        # 使用专用列表注释显示
+        if grep -q "# LIST: " "$SCRIPT_RULES_FILE"; then
             while IFS= read -r line; do
-                if [[ "$line" =~ dnat.*to.*([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+:[0-9]+|[0-9]+) ]] || [[ "$line" =~ dnat.*to.*\[.*\]:[0-9]+ ]]; then
-                    # 提取端口和协议信息
-                    local port=$(echo "$line" | grep -oE "dport [0-9]+(-[0-9]+)?" | awk '{print $2}')
-                    local protocol=$(echo "$line" | grep -oE "tcp|udp" | head -1)
-                    local target=$(echo "$line" | grep -oE "to [^ ]+" | awk '{print $2}')
-                    
-                    if [ -n "$port" ] && [ -n "$target" ]; then
-                        protocol=${protocol:-tcp}
-                        echo -e "转发: ${port}/${protocol} -> ${target}"
-                        has_forward_rules=1
-                    fi
+                # 提取列表信息
+                list_info=$(echo "$line" | sed 's/# LIST: //')
+                
+                # 初始化变量
+                local ext_port=""
+                local target_full=""
+                local target_ip=""
+                local target_port=""
+                
+                # 正确解析端口范围和目标（处理IPv6地址）
+                if [[ "$list_info" =~ ([0-9]+-[0-9]+)-(.+) ]]; then
+                    # 端口范围情况: 4001-4999->target
+                    ext_port="${BASH_REMATCH[1]}"
+                    target_full="${BASH_REMATCH[2]}"
+                elif [[ "$list_info" =~ ([0-9]+)-(.+) ]]; then
+                    # 单个端口情况: 4001->target
+                    ext_port="${BASH_REMATCH[1]}"
+                    target_full="${BASH_REMATCH[2]}"
+                else
+                    # 无法解析的格式，跳过
+                    continue
                 fi
-            done < <(grep "dnat to" "$SCRIPT_RULES_FILE")
+                
+                # 解析目标地址和端口（处理IPv6）
+                if [[ "$target_full" =~ ^\[.*\]:([0-9]+)$ ]]; then
+                    # IPv6格式: [address]:port
+                    target_ip=$(echo "$target_full" | sed 's/\[\(.*\)\]:[0-9]\+$/\1/')
+                    target_port=$(echo "$target_full" | sed 's/.*:\([0-9]\+\)$/\1/')
+                elif [[ "$target_full" =~ :([0-9]+)$ ]] && [[ ! "$target_full" =~ ^\[.*\] ]]; then
+                    # IPv4格式: ip:port
+                    target_ip=$(echo "$target_full" | sed 's/:.*//')
+                    target_port=$(echo "$target_full" | sed 's/.*://')
+                elif [[ "$target_full" =~ ^[0-9]+$ ]]; then
+                    # 只有端口号的情况（默认本地）
+                    target_ip="127.0.0.1"
+                    target_port="$target_full"
+                else
+                    # 无法解析的目标格式
+                    target_ip="unknown"
+                    target_port="unknown"
+                fi
+                
+                # 协议从实际规则中获取（默认tcp）
+                protocol="tcp"
+                
+                # 判断IP类型并格式化显示
+                if [[ "$target_ip" =~ : ]]; then
+                    ip_type="${GREEN}[IPv6]${NC}"
+                    display_target="[${target_ip}]:${target_port}"
+                else
+                    ip_type="${BLUE}[IPv4]${NC}"
+                    display_target="${target_ip}:${target_port}"
+                fi
+                
+                # 判断转发类型
+                if [ "$target_ip" = "127.0.0.1" ] || [ "$target_ip" = "::1" ]; then
+                    type_label="${BLUE}[本地转发]${NC}"
+                else
+                    type_label="${GREEN}[远程转发]${NC}"
+                fi
+                
+                # 判断是否为端口范围
+                if [[ "$ext_port" =~ - ]]; then
+                    port_label="端口范围"
+                else
+                    port_label="端口"
+                fi
+                
+                echo -e "${port_label}: ${ext_port}/${protocol} -> ${display_target} $type_label $ip_type"
+                has_rules=1
+                
+            done < <(grep "# LIST: " "$SCRIPT_RULES_FILE")
         fi
         
-        if [ $has_forward_rules -eq 0 ]; then
+        if [ $has_rules -eq 0 ]; then
             echo -e "${YELLOW}无端口转发规则${NC}"
         fi
         
         echo
         
-        # 显示入站控制规则
+        # 显示入站控制规则（增强版，显示IP信息）
         echo -e "${BLUE}--- 入站控制规则 ---${NC}"
         local has_access_rules=0
         
-        # 检查accept规则
-        if grep -q "dport.*accept" "$SCRIPT_RULES_FILE"; then
-            while IFS= read -r line; do
-                local port=$(echo "$line" | grep -oE "dport [0-9]+(-[0-9]+)?" | awk '{print $2}')
-                local protocol=$(echo "$line" | grep -oE "tcp|udp" | head -1)
-                local source_ip=$(echo "$line" | grep -oE "saddr [^ ]+" | awk '{print $2}' || echo "any")
-                
-                if [ -n "$port" ]; then
-                    protocol=${protocol:-tcp}
-                    echo -e "允许: ${port}/${protocol} 来自 ${source_ip}"
-                    has_access_rules=1
+        # 检查input链中的accept规则（排除注释行）
+        while IFS= read -r line; do
+            # 支持端口范围匹配
+            port=$(echo "$line" | grep -oE "dport [0-9]+(-[0-9]+)?" | awk '{print $2}')
+            protocol=$(echo "$line" | grep -oE "tcp|udp")
+            
+            # 检查是否有源IP限制
+            source_ip=""
+            if [[ "$line" =~ saddr[[:space:]]+([0-9a-fA-F\.:]+) ]]; then
+                source_ip="${BASH_REMATCH[1]}"
+            fi
+            
+            if [ -n "$port" ]; then
+                if [ -n "$source_ip" ]; then
+                    # 有源IP限制
+                    if [[ "$port" =~ - ]]; then
+                        echo -e "允许: ${port}/${protocol} 来自 ${source_ip} ${GREEN}[允许特定IP - 端口范围]${NC}"
+                    else
+                        echo -e "允许: ${port}/${protocol} 来自 ${source_ip} ${GREEN}[允许特定IP]${NC}"
+                    fi
+                else
+                    # 无源IP限制
+                    if [[ "$port" =~ - ]]; then
+                        echo -e "允许: ${port}/${protocol} ${GREEN}[允许所有IP - 端口范围]${NC}"
+                    else
+                        echo -e "允许: ${port}/${protocol} ${GREEN}[允许所有IP]${NC}"
+                    fi
                 fi
-            done < <(grep "dport.*accept" "$SCRIPT_RULES_FILE")
-        fi
+                has_access_rules=1
+            fi
+        done < <(awk '/chain input {/,/^    }/ {if (/accept/ && /dport/ && !/#/) print}' "$SCRIPT_RULES_FILE")
         
-        # 检查drop规则
-        if grep -q "dport.*drop" "$SCRIPT_RULES_FILE"; then
-            while IFS= read -r line; do
-                local port=$(echo "$line" | grep -oE "dport [0-9]+(-[0-9]+)?" | awk '{print $2}')
-                local protocol=$(echo "$line" | grep -oE "tcp|udp" | head -1)
-                local source_ip=$(echo "$line" | grep -oE "saddr [^ ]+" | awk '{print $2}' || echo "any")
-                
-                if [ -n "$port" ]; then
-                    protocol=${protocol:-tcp}
-                    echo -e "拒绝: ${port}/${protocol} 来自 ${source_ip}"
-                    has_access_rules=1
+        # 检查input链中的drop规则（排除注释行）
+        while IFS= read -r line; do
+            port=$(echo "$line" | grep -oE "dport [0-9]+(-[0-9]+)?" | awk '{print $2}')
+            protocol=$(echo "$line" | grep -oE "tcp|udp")
+            
+            # 检查是否有源IP限制
+            source_ip=""
+            if [[ "$line" =~ saddr[[:space:]]+([0-9a-fA-F\.:]+) ]]; then
+                source_ip="${BASH_REMATCH[1]}"
+            fi
+            
+            if [ -n "$port" ] && [ -n "$protocol" ]; then
+                if [ -n "$source_ip" ]; then
+                    # 有源IP限制
+                    if [[ "$port" =~ - ]]; then
+                        echo -e "拒绝: ${port}/${protocol} 来自 ${source_ip} ${RED}[拒绝特定IP - 端口范围]${NC}"
+                    else
+                        echo -e "拒绝: ${port}/${protocol} 来自 ${source_ip} ${RED}[拒绝特定IP]${NC}"
+                    fi
+                else
+                    # 无源IP限制
+                    if [[ "$port" =~ - ]]; then
+                        echo -e "拒绝: ${port}/${protocol} ${RED}[拒绝所有IP - 端口范围]${NC}"
+                    else
+                        echo -e "拒绝: ${port}/${protocol} ${RED}[拒绝所有IP]${NC}"
+                    fi
                 fi
-            done < <(grep "dport.*drop" "$SCRIPT_RULES_FILE")
-        fi
+                has_access_rules=1
+            fi
+        done < <(awk '/chain input {/,/^    }/ {if (/drop/ && /dport/ && !/#/) print}' "$SCRIPT_RULES_FILE")
+        
+        # 检查input链中的reject规则（排除注释行）
+        while IFS= read -r line; do
+            port=$(echo "$line" | grep -oE "dport [0-9]+(-[0-9]+)?" | awk '{print $2}')
+            protocol=$(echo "$line" | grep -oE "tcp|udp")
+            
+            # 检查是否有源IP限制
+            source_ip=""
+            if [[ "$line" =~ saddr[[:space:]]+([0-9a-fA-F\.:]+) ]]; then
+                source_ip="${BASH_REMATCH[1]}"
+            fi
+            
+            if [ -n "$port" ] && [ -n "$protocol" ]; then
+                if [ -n "$source_ip" ]; then
+                    # 有源IP限制
+                    if [[ "$port" =~ - ]]; then
+                        echo -e "拒绝: ${port}/${protocol} 来自 ${source_ip} ${RED}[拒绝特定IP - 端口范围]${NC}"
+                    else
+                        echo -e "拒绝: ${port}/${protocol} 来自 ${source_ip} ${RED}[拒绝特定IP]${NC}"
+                    fi
+                else
+                    # 无源IP限制
+                    if [[ "$port" =~ - ]]; then
+                        echo -e "拒绝: ${port}/${protocol} ${RED}[拒绝所有IP - 端口范围]${NC}"
+                    else
+                        echo -e "拒绝: ${port}/${protocol} ${RED}[拒绝所有IP]${NC}"
+                    fi
+                fi
+                has_access_rules=1
+            fi
+        done < <(awk '/chain input {/,/^    }/ {if (/reject/ && /dport/ && !/#/) print}' "$SCRIPT_RULES_FILE")
         
         if [ $has_access_rules -eq 0 ]; then
             echo -e "${YELLOW}无入站控制规则${NC}"
@@ -816,16 +1086,33 @@ list_all_rules() {
     echo -e "${YELLOW}====================${NC}"
 }
 
-# 重新加载规则
+# 重新加载规则（只重新加载脚本规则）
 reload_rules() {
     echo -e "${YELLOW}重新加载脚本规则${NC}"
     echo -e "${BLUE}注意: 只重新加载脚本管理的规则，不影响其他服务${NC}"
     
-    apply_rules_file
-    echo -e "${GREEN}脚本规则已重新加载${NC}"
+    # 只刷新脚本管理的表
+    nft flush table inet script_filter 2>/dev/null
+    nft flush table inet script_nat 2>/dev/null
+    nft flush table ip6 script_nat 2>/dev/null
+    nft delete table inet script_filter 2>/dev/null
+    nft delete table inet script_nat 2>/dev/null
+    nft delete table ip6 script_nat 2>/dev/null
+    
+    # 重新加载脚本规则文件
+    if [ -f "$SCRIPT_RULES_FILE" ]; then
+        nft -f "$SCRIPT_RULES_FILE"
+        echo -e "${GREEN}脚本规则已重新加载${NC}"
+    else
+        echo -e "${RED}脚本规则文件不存在${NC}"
+        return 1
+    fi
+    
+    echo -e "${BLUE}当前活动的规则表:${NC}"
+    nft list tables
 }
 
-# 添加nft自启
+# 添加nft自启（防止重启失效）
 enable_autostart() {
     if command -v systemctl &> /dev/null; then
         if systemctl enable nftables 2>/dev/null; then
@@ -834,6 +1121,7 @@ enable_autostart() {
             echo -e "${RED}启用开机自启失败${NC}"
         fi
     elif command -v rc-update &> /dev/null; then
+        # Alpine Linux (OpenRC)
         if rc-update add nftables default 2>/dev/null; then
             echo -e "${GREEN}nftables开机自启已启用 (OpenRC)${NC}"
         else
@@ -841,6 +1129,19 @@ enable_autostart() {
         fi
     else
         echo -e "${YELLOW}无法确定init系统，请手动设置开机自启${NC}"
+    fi
+    
+    echo -e "${BLUE}可以使用以下命令管理:${NC}"
+    if command -v systemctl &> /dev/null; then
+        echo "systemctl status nftables  # 查看状态"
+        echo "systemctl disable nftables # 禁用自启"
+        echo "systemctl start nftables   # 启动服务"
+        echo "systemctl stop nftables    # 停止服务"
+    elif command -v rc-update &> /dev/null; then
+        echo "rc-service nftables status  # 查看状态"
+        echo "rc-update del nftables      # 禁用自启"
+        echo "rc-service nftables start   # 启动服务"
+        echo "rc-service nftables stop    # 停止服务"
     fi
 }
 
