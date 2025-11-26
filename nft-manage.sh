@@ -177,14 +177,66 @@ detect_wan_interface() {
 # 网络接口配置
 WAN_IFACE=$(detect_wan_interface)
 
-# 验证端口格式（支持单个端口和端口范围）
-validate_port() {
+# 验证单个端口格式
+validate_single_port() {
     local port="$1"
-    # 支持单个端口：123 或 端口范围：100-200
-    if [[ "$port" =~ ^[0-9]+$ ]] || [[ "$port" =~ ^[0-9]+-[0-9]+$ ]]; then
+    if [[ "$port" =~ ^[0-9]+$ ]] && [ "$port" -ge 1 ] && [ "$port" -le 65535 ]; then
         return 0
     else
         return 1
+    fi
+}
+
+# 验证端口范围格式
+validate_port_range() {
+    local port_range="$1"
+    if [[ "$port_range" =~ ^[0-9]+-[0-9]+$ ]]; then
+        local start_port=$(echo "$port_range" | cut -d'-' -f1)
+        local end_port=$(echo "$port_range" | cut -d'-' -f2)
+        if [ "$start_port" -le "$end_port" ] && [ "$start_port" -ge 1 ] && [ "$end_port" -le 65535 ]; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# 验证端口格式（支持单个端口、端口范围和逗号分隔）
+validate_port() {
+    local port_input="$1"
+    
+    # 如果包含逗号，分割验证每个部分
+    if [[ "$port_input" == *","* ]]; then
+        IFS=',' read -ra port_parts <<< "$port_input"
+        for part in "${port_parts[@]}"; do
+            local trimmed_part=$(echo "$part" | xargs)  # 去除空格
+            if ! validate_single_port "$trimmed_part" && ! validate_port_range "$trimmed_part"; then
+                return 1
+            fi
+        done
+        return 0
+    else
+        # 单个端口或端口范围
+        if validate_single_port "$port_input" || validate_port_range "$port_input"; then
+            return 0
+        else
+            return 1
+        fi
+    fi
+}
+
+# 解析端口输入为数组
+parse_port_input() {
+    local port_input="$1"
+    local -n port_array="$2"  # 使用nameref传递数组
+    
+    if [[ "$port_input" == *","* ]]; then
+        IFS=',' read -ra temp_array <<< "$port_input"
+        for part in "${temp_array[@]}"; do
+            local trimmed_part=$(echo "$part" | xargs)  # 去除空格
+            port_array+=("$trimmed_part")
+        done
+    else
+        port_array+=("$port_input")
     fi
 }
 
@@ -291,7 +343,70 @@ apply_rules_file() {
     fi
 }
 
-# 在规则文件中添加规则（修复版）
+# 清理空的表和链
+cleanup_empty_tables() {
+    if [ ! -f "$SCRIPT_RULES_FILE" ]; then
+        return 0
+    fi
+    
+    local temp_file=$(mktemp)
+    local in_table=0
+    local current_table=""
+    local table_content=""
+    local has_rules=0
+    
+    # 读取原文件
+    while IFS= read -r line; do
+        # 检测表开始
+        if [[ "$line" =~ ^table[[:space:]]+([^[:space:]]+)[[:space:]]+([^[:space:]]+)[[:space:]]*\{[[:space:]]*$ ]]; then
+            if [ $in_table -eq 1 ]; then
+                # 结束上一个表
+                if [ $has_rules -eq 1 ]; then
+                    echo "$table_content" >> "$temp_file"
+                    echo "}" >> "$temp_file"
+                fi
+            fi
+            
+            in_table=1
+            current_table="${BASH_REMATCH[1]} ${BASH_REMATCH[2]}"
+            table_content="$line"
+            has_rules=0
+            continue
+        fi
+        
+        # 在表中
+        if [ $in_table -eq 1 ]; then
+            table_content="$table_content"$'\n'"$line"
+            
+            # 检测表结束
+            if [[ "$line" =~ ^[[:space:]]*}[[:space:]]*$ ]]; then
+                if [ $has_rules -eq 1 ]; then
+                    echo "$table_content" >> "$temp_file"
+                fi
+                in_table=0
+                current_table=""
+                table_content=""
+                has_rules=0
+            # 检测是否有实际规则（非空行、非注释、非仅包含链定义）
+            elif [[ "$line" =~ ^[[:space:]]+[^[:space:]#] ]] && [[ ! "$line" =~ chain[[:space:]]+[^[:space:]]+[[:space:]]*\{[[:space:]]*$ ]] && [[ ! "$line" =~ ^[[:space:]]*$ ]]; then
+                has_rules=1
+            fi
+        else
+            # 不在表中，直接写入
+            echo "$line" >> "$temp_file"
+        fi
+    done < "$SCRIPT_RULES_FILE"
+    
+    # 处理最后一个表
+    if [ $in_table -eq 1 ] && [ $has_rules -eq 1 ]; then
+        echo "$table_content" >> "$temp_file"
+    fi
+    
+    # 替换原文件
+    mv "$temp_file" "$SCRIPT_RULES_FILE"
+}
+
+# 在规则文件中添加规则（修复版，避免创建空表）
 add_rule_to_file() {
     local table="$1"
     local chain="$2"
@@ -299,13 +414,21 @@ add_rule_to_file() {
     
     local temp_file=$(mktemp)
     local rule_inserted=0
+    local table_found=0
+    local chain_found=0
     
     # 读取文件并插入规则
     while IFS= read -r line; do
         echo "$line" >> "$temp_file"
         
-        # 找到目标链并在其开始大括号后插入规则
-        if [[ "$line" =~ ^[[:space:]]*chain[[:space:]]+$chain[[:space:]]+{[[:space:]]*$ ]] && [[ $rule_inserted -eq 0 ]]; then
+        # 找到目标表
+        if [[ "$line" =~ ^table[[:space:]]+$table[[:space:]]*\{[[:space:]]*$ ]]; then
+            table_found=1
+        fi
+        
+        # 在目标表中找到目标链
+        if [ $table_found -eq 1 ] && [[ "$line" =~ ^[[:space:]]*chain[[:space:]]+$chain[[:space:]]*\{[[:space:]]*$ ]] && [ $rule_inserted -eq 0 ]; then
+            chain_found=1
             # 读取下一行（应该是链的内容开始）
             while IFS= read -r next_line; do
                 echo "$next_line" >> "$temp_file"
@@ -320,15 +443,12 @@ add_rule_to_file() {
         fi
     done < "$SCRIPT_RULES_FILE"
     
-    # 如果没找到链，在文件末尾添加
+    # 如果没找到表或链，不自动创建（避免产生空表）
     if [[ $rule_inserted -eq 0 ]]; then
-        echo "# 自动添加的表和链" >> "$temp_file"
-        echo "table $table {" >> "$temp_file"
-        echo "    chain $chain {" >> "$temp_file"
-        echo "        $rule" >> "$temp_file"
-        echo "    }" >> "$temp_file"
-        echo "}" >> "$temp_file"
-        rule_inserted=1
+        rm -f "$temp_file"
+        echo -e "${RED}错误: 在表 $table 中找不到链 $chain${NC}"
+        echo -e "${YELLOW}请先确保表结构正确创建${NC}"
+        return 1
     fi
     
     if [[ $rule_inserted -eq 1 ]]; then
@@ -346,6 +466,9 @@ delete_rule_from_file() {
     if [ -f "$SCRIPT_RULES_FILE" ]; then
         # 使用更精确的匹配，避免误删，保留空行
         grep -v "$pattern" "$SCRIPT_RULES_FILE" > "${SCRIPT_RULES_FILE}.tmp" && mv "${SCRIPT_RULES_FILE}.tmp" "$SCRIPT_RULES_FILE"
+        
+        # 删除后清理空表
+        cleanup_empty_tables
     fi
 }
 
@@ -399,79 +522,157 @@ EOF
     echo -e "${GREEN}已清空所有脚本管理的规则${NC}"
 }
 
-# 添加端口转发（修复IPv6规则语法）
+# 添加端口转发（增强版，支持批量端口和all协议）
 add_port_forward() {
     echo -e "${YELLOW}添加端口转发${NC}"
     echo -e "${BLUE}提示: 按回车默认使用本地转发(127.0.0.1或::1)${NC}"
-    echo -e "${BLUE}支持单个端口(80)或端口范围(1000-2000)${NC}"
+    echo -e "${BLUE}支持格式:${NC}"
+    echo -e "  ${GREEN}单个端口:${NC} 80"
+    echo -e "  ${GREEN}端口范围:${NC} 1000-2000"  
+    echo -e "  ${GREEN}多个端口:${NC} 80,443,1000-2000,3000"
     
-    read -p "请输入外部端口: " ext_port
+    read -p "请输入外部端口: " ext_port_input
     read -p "请输入目标IP(默认127.0.0.1): " target_ip
     target_ip=${target_ip:-127.0.0.1}
-    read -p "请输入目标端口: " target_port
-    read -p "请输入协议(tcp/udp, 默认tcp): " protocol
-    protocol=${protocol:-tcp}
+    read -p "请输入目标端口: " target_port_input
     
-    # 验证端口格式
-    if ! validate_port "$ext_port" || ! validate_port "$target_port"; then
-        echo -e "${RED}错误: 端口格式不正确，请使用数字或范围(如100-200)${NC}"
+    # 协议选择（增加all选项）
+    while true; do
+        read -p "请输入协议(tcp/udp/all, 默认tcp): " protocol
+        protocol=${protocol:-tcp}
+        if [[ "$protocol" == "tcp" || "$protocol" == "udp" || "$protocol" == "all" ]]; then
+            break
+        else
+            echo -e "${RED}错误: 协议必须是 tcp、udp 或 all${NC}"
+        fi
+    done
+    
+    # 验证外部端口格式
+    if ! validate_port "$ext_port_input"; then
+        echo -e "${RED}错误: 外部端口格式不正确${NC}"
+        echo -e "${YELLOW}支持的格式: 单个端口(80), 端口范围(1000-2000), 多个端口(80,443,1000-2000)${NC}"
         return 1
     fi
     
-    # 生成唯一的注释标识（用于删除）
-    local delete_comment="comment \"${ext_port}->${target_ip}:${target_port}\""
+    # 验证目标端口格式
+    if ! validate_port "$target_port_input"; then
+        echo -e "${RED}错误: 目标端口格式不正确${NC}"
+        echo -e "${YELLOW}支持的格式: 单个端口(80), 端口范围(1000-2000), 多个端口(80,443,1000-2000)${NC}"
+        return 1
+    fi
     
-    # 生成专用的列表显示注释（简化版）
-    local list_comment="comment \"LIST: ${ext_port}->${target_ip}:${target_port}\""
+    # 解析端口输入
+    local ext_ports=()
+    local target_ports=()
+    parse_port_input "$ext_port_input" ext_ports
+    parse_port_input "$target_port_input" target_ports
     
-    # 判断IP类型并构建正确的nftables规则
-    local dnat_rule
-    local snat_rule=""
-    
-    if [[ "$target_ip" =~ : ]]; then
-        # IPv6规则 - 获取本机公网IPv6
-        local public_ipv6=$(get_public_ipv6)
-        if [ -z "$public_ipv6" ]; then
-            echo -e "${RED}无法获取公网IPv6地址，请手动输入: ${NC}"
-            read -p "请输入您的公网IPv6地址: " public_ipv6
-            if [ -z "$public_ipv6" ]; then
-                echo -e "${RED}未提供公网IPv6地址，无法创建IPv6转发${NC}"
-                return 1
-            fi
-        fi
-        
-        # 修复IPv6规则语法
-        dnat_rule="tcp dport ${ext_port} dnat to [${target_ip}]:${target_port} ${delete_comment}"
-        snat_rule="oifname \"${WAN_IFACE}\" snat to ${public_ipv6} ${delete_comment}"
-        
-        echo -e "${BLUE}检测到IPv6地址，使用IPv6转发规则${NC}"
-        
-        # 添加到ip6 script_nat表
-        if add_rule_to_file "ip6 script_nat" "prerouting" "$dnat_rule"; then
-            add_rule_to_file "ip6 script_nat" "postrouting" "$snat_rule"
-            echo -e "${GREEN}IPv6端口转发规则已添加${NC}"
-        fi
-        
-    else
-        # IPv4规则
-        dnat_rule="ip protocol ${protocol} ${protocol} dport ${ext_port} dnat to ${target_ip}:${target_port} ${delete_comment}"
-        snat_rule="oifname \"${WAN_IFACE}\" masquerade ${delete_comment}"
-        
-        echo -e "${BLUE}使用IPv4转发规则${NC}"
-        
-        # 添加到inet script_nat表
-        if add_rule_to_file "inet script_nat" "prerouting" "$dnat_rule"; then
-            add_rule_to_file "inet script_nat" "postrouting" "$snat_rule"
-            echo -e "${GREEN}IPv4端口转发规则已添加${NC}"
+    # 检查端口数量匹配
+    if [ ${#ext_ports[@]} -ne ${#target_ports[@]} ]; then
+        if [ ${#target_ports[@]} -eq 1 ]; then
+            # 如果目标端口只有一个，扩展到与外部端口相同数量
+            local single_target_port="${target_ports[0]}"
+            target_ports=()
+            for ((i=0; i<${#ext_ports[@]}; i++)); do
+                target_ports+=("$single_target_port")
+            done
+            echo -e "${BLUE}使用相同目标端口: $single_target_port 用于所有外部端口${NC}"
+        else
+            echo -e "${RED}错误: 外部端口数量(${#ext_ports[@]})与目标端口数量(${#target_ports[@]})不匹配${NC}"
+            echo -e "${YELLOW}请确保端口数量相同，或只提供一个目标端口用于所有外部端口${NC}"
+            return 1
         fi
     fi
+    
+    local protocols=()
+    if [ "$protocol" == "all" ]; then
+        protocols=("tcp" "udp")
+        echo -e "${BLUE}同时添加 TCP 和 UDP 协议规则${NC}"
+    else
+        protocols=("$protocol")
+    fi
+    
+    local success_count=0
+    local total_count=0
+    
+    # 计算总规则数
+    for proto in "${protocols[@]}"; do
+        for ((i=0; i<${#ext_ports[@]}; i++)); do
+            ((total_count++))
+        done
+    done
+    
+    echo -e "${BLUE}即将添加 $total_count 条转发规则...${NC}"
+    
+    # 添加规则
+    for proto in "${protocols[@]}"; do
+        for ((i=0; i<${#ext_ports[@]}; i++)); do
+            local ext_port="${ext_ports[i]}"
+            local target_port="${target_ports[i]}"
+            
+            # 生成唯一的注释标识（包含协议信息）
+            local unique_id="${ext_port}_${proto}_${target_ip}_${target_port}"
+            local delete_comment="comment \"${unique_id}\""
+            
+            # 判断IP类型并构建正确的nftables规则
+            local dnat_rule
+            local snat_rule=""
+            
+            if [[ "$target_ip" =~ : ]]; then
+                # IPv6规则 - 获取本机公网IPv6
+                local public_ipv6=$(get_public_ipv6)
+                if [ -z "$public_ipv6" ]; then
+                    echo -e "${RED}无法获取公网IPv6地址，请手动输入: ${NC}"
+                    read -p "请输入您的公网IPv6地址: " public_ipv6
+                    if [ -z "$public_ipv6" ]; then
+                        echo -e "${RED}未提供公网IPv6地址，无法创建IPv6转发${NC}"
+                        return 1
+                    fi
+                fi
+                
+                # IPv6规则语法
+                if [ "$proto" = "tcp" ]; then
+                    dnat_rule="tcp dport ${ext_port} dnat to [${target_ip}]:${target_port} ${delete_comment}"
+                else
+                    dnat_rule="udp dport ${ext_port} dnat to [${target_ip}]:${target_port} ${delete_comment}"
+                fi
+                snat_rule="oifname \"${WAN_IFACE}\" snat to ${public_ipv6} ${delete_comment}"
+                
+                # 添加到ip6 script_nat表
+                if add_rule_to_file "ip6 script_nat" "prerouting" "$dnat_rule"; then
+                    add_rule_to_file "ip6 script_nat" "postrouting" "$snat_rule"
+                    ((success_count++))
+                    echo -e "${GREEN}✓ 添加 IPv6 ${proto} 转发: ${ext_port} -> ${target_ip}:${target_port}${NC}"
+                else
+                    echo -e "${RED}✗ 添加 IPv6 ${proto} 转发失败: ${ext_port} -> ${target_ip}:${target_port}${NC}"
+                fi
+                
+            else
+                # IPv4规则 - 修复inet表DNAT语法
+                # 在inet表中必须明确指定ip协议
+                if [ "$proto" = "tcp" ]; then
+                    dnat_rule="ip protocol tcp tcp dport ${ext_port} dnat to ${target_ip}:${target_port} ${delete_comment}"
+                else
+                    dnat_rule="ip protocol udp udp dport ${ext_port} dnat to ${target_ip}:${target_port} ${delete_comment}"
+                fi
+                snat_rule="oifname \"${WAN_IFACE}\" masquerade ${delete_comment}"
+                
+                # 添加到inet script_nat表
+                if add_rule_to_file "inet script_nat" "prerouting" "$dnat_rule"; then
+                    add_rule_to_file "inet script_nat" "postrouting" "$snat_rule"
+                    ((success_count++))
+                    echo -e "${GREEN}✓ 添加 IPv4 ${proto} 转发: ${ext_port} -> ${target_ip}:${target_port}${NC}"
+                else
+                    echo -e "${RED}✗ 添加 IPv4 ${proto} 转发失败: ${ext_port} -> ${target_ip}:${target_port}${NC}"
+                fi
+            fi
+        done
+    done
     
     # 应用新规则
     apply_rules_file
     
-    echo -e "${GREEN}端口转发已添加: ${NC}"
-    echo -e "外部端口: ${ext_port}/${protocol}"
-    echo -e "目标地址: ${target_ip}:${target_port}"
+    echo -e "${GREEN}端口转发添加完成: ${success_count}/${total_count} 条规则成功${NC}"
     if [ "$target_ip" = "127.0.0.1" ] || [ "$target_ip" = "::1" ]; then
         echo -e "类型: ${BLUE}本地端口转发${NC}"
     else
@@ -479,42 +680,80 @@ add_port_forward() {
     fi
 }
 
-# 删除端口转发（修复注释匹配）
+# 删除端口转发（增强版，支持批量端口和all协议）
 delete_port_forward() {
     echo -e "${YELLOW}删除端口转发${NC}"
-    read -p "请输入要删除的外部端口: " ext_port
-    read -p "请输入协议(tcp/udp, 默认tcp): " protocol
-    protocol=${protocol:-tcp}
+    echo -e "${BLUE}支持格式:${NC}"
+    echo -e "  ${GREEN}单个端口:${NC} 80"
+    echo -e "  ${GREEN}端口范围:${NC} 1000-2000"  
+    echo -e "  ${GREEN}多个端口:${NC} 80,443,1000-2000,3000"
+    
+    read -p "请输入要删除的外部端口: " ext_port_input
+    
+    # 协议选择（增加all选项）
+    while true; do
+        read -p "请输入协议(tcp/udp/all, 默认tcp): " protocol
+        protocol=${protocol:-tcp}
+        if [[ "$protocol" == "tcp" || "$protocol" == "udp" || "$protocol" == "all" ]]; then
+            break
+        else
+            echo -e "${RED}错误: 协议必须是 tcp、udp 或 all${NC}"
+        fi
+    done
     
     # 验证端口格式
-    if ! validate_port "$ext_port"; then
+    if ! validate_port "$ext_port_input"; then
         echo -e "${RED}错误: 端口格式不正确${NC}"
+        echo -e "${YELLOW}支持的格式: 单个端口(80), 端口范围(1000-2000), 多个端口(80,443,1000-2000)${NC}"
         return 1
     fi
     
-    echo -e "${BLUE}正在删除端口 ${ext_port}/${protocol} 的转发规则...${NC}"
+    # 解析端口输入
+    local ext_ports=()
+    parse_port_input "$ext_port_input" ext_ports
     
-    # 使用注释模式匹配
-    local pattern="comment.*${ext_port}-"
-    
-    # 删除所有包含该注释的规则
-    if [ -f "$SCRIPT_RULES_FILE" ]; then
-        # 创建临时文件
-        local temp_file=$(mktemp)
-        
-        # 过滤掉包含目标注释的行
-        grep -v "$pattern" "$SCRIPT_RULES_FILE" > "$temp_file"
-        
-        # 替换原文件
-        mv "$temp_file" "$SCRIPT_RULES_FILE"
-        
-        # 重新应用规则
-        apply_rules_file
-        
-        echo -e "${GREEN}已删除端口 ${ext_port}/${protocol} 的所有转发规则${NC}"
+    local protocols=()
+    if [ "$protocol" == "all" ]; then
+        protocols=("tcp" "udp")
+        echo -e "${BLUE}同时删除 TCP 和 UDP 协议规则${NC}"
     else
-        echo -e "${RED}规则文件不存在${NC}"
-        return 1
+        protocols=("$protocol")
+    fi
+    
+    echo -e "${BLUE}正在删除端口 ${ext_port_input} 的转发规则...${NC}"
+    
+    local deleted_count=0
+    for proto in "${protocols[@]}"; do
+        for ext_port in "${ext_ports[@]}"; do
+            # 构建精确的匹配模式，包含协议信息
+            local pattern="${ext_port}_${proto}_"
+            
+            # 删除所有包含该唯一标识的规则
+            if [ -f "$SCRIPT_RULES_FILE" ]; then
+                # 创建临时文件
+                local temp_file=$(mktemp)
+                
+                # 过滤掉包含目标唯一标识的行
+                grep -v "$pattern" "$SCRIPT_RULES_FILE" > "$temp_file"
+                
+                # 替换原文件
+                mv "$temp_file" "$SCRIPT_RULES_FILE"
+                
+                ((deleted_count++))
+                echo -e "${GREEN}✓ 删除 ${proto} 端口 ${ext_port} 的转发规则${NC}"
+            fi
+        done
+    done
+    
+    # 清理空表并重新应用规则
+    cleanup_empty_tables
+    apply_rules_file
+    
+    echo -e "${GREEN}已删除 ${deleted_count} 条转发规则${NC}"
+    if [ "$protocol" == "all" ]; then
+        echo -e "${BLUE}注意: 删除了TCP和UDP协议的规则${NC}"
+    else
+        echo -e "${BLUE}注意: 只删除了${protocol}协议的规则${NC}"
     fi
 }
 
@@ -540,16 +779,28 @@ validate_ip() {
     return 1
 }
 
-# 允许入站（修复规则语法）
+# 允许入站（增强版，支持批量端口和all协议）
 allow_port() {
     echo -e "${YELLOW}允许入站${NC}"
-    echo -e "${BLUE}支持单个端口(80)或端口范围(1000-2000)${NC}"
+    echo -e "${BLUE}支持格式:${NC}"
+    echo -e "  ${GREEN}单个端口:${NC} 80"
+    echo -e "  ${GREEN}端口范围:${NC} 1000-2000"  
+    echo -e "  ${GREEN}多个端口:${NC} 80,443,1000-2000,3000"
     echo -e "${BLUE}可以指定允许访问的源IP，不输入则允许所有IP${NC}"
     echo -e "${BLUE}支持IPv4(192.168.1.1)、IPv6(2001:db8::1)和CIDR(192.168.1.0/24)格式${NC}"
     
-    read -p "请输入端口号: " port
-    read -p "请输入协议(tcp/udp, 默认tcp): " protocol
-    protocol=${protocol:-tcp}
+    read -p "请输入端口号: " port_input
+    
+    # 协议选择（增加all选项）
+    while true; do
+        read -p "请输入协议(tcp/udp/all, 默认tcp): " protocol
+        protocol=${protocol:-tcp}
+        if [[ "$protocol" == "tcp" || "$protocol" == "udp" || "$protocol" == "all" ]]; then
+            break
+        else
+            echo -e "${RED}错误: 协议必须是 tcp、udp 或 all${NC}"
+        fi
+    done
     
     # 询问源IP
     while true; do
@@ -572,53 +823,94 @@ allow_port() {
     done
     
     # 验证端口格式
-    if ! validate_port "$port"; then
+    if ! validate_port "$port_input"; then
         echo -e "${RED}错误: 端口格式不正确，请使用数字或范围(如100-200)${NC}"
+        echo -e "${YELLOW}支持的格式: 单个端口(80), 端口范围(1000-2000), 多个端口(80,443,1000-2000)${NC}"
         return 1
     fi
     
-    # 生成注释
-    local rule_comment="comment \"ALLOW: ${port}/${protocol} from ${source_ip:-any}\""
+    # 解析端口输入
+    local ports=()
+    parse_port_input "$port_input" ports
     
-    # 构建规则
-    local rule=""
-    if [ -n "$source_ip" ] && [ "$source_ip" != "any" ]; then
-        # 指定了源IP
-        if [[ "$source_ip" =~ : ]]; then
-            # IPv6地址
-            rule="ip6 saddr ${source_ip} ${protocol} dport ${port} accept ${rule_comment}"
-        else
-            # IPv4地址
-            rule="ip saddr ${source_ip} ${protocol} dport ${port} accept ${rule_comment}"
-        fi
-        echo -e "${GREEN}已允许来自 ${source_ip} 的端口访问: ${port}/${protocol}${NC}"
+    local protocols=()
+    if [ "$protocol" == "all" ]; then
+        protocols=("tcp" "udp")
+        echo -e "${BLUE}同时添加 TCP 和 UDP 协议规则${NC}"
     else
-        # 允许所有IP
-        rule="${protocol} dport ${port} accept ${rule_comment}"
-        echo -e "${GREEN}已允许所有IP访问端口: ${port}/${protocol}${NC}"
+        protocols=("$protocol")
     fi
     
-    # 添加到filter表
-    if add_rule_to_file "inet script_filter" "input" "$rule"; then
-        # 应用新规则
-        apply_rules_file
-        echo -e "${GREEN}入站规则已添加${NC}"
-    else
-        echo -e "${RED}添加规则失败${NC}"
-        return 1
-    fi
+    local success_count=0
+    local total_count=$(( ${#ports[@]} * ${#protocols[@]} ))
+    
+    echo -e "${BLUE}即将添加 $total_count 条允许规则...${NC}"
+    
+    # 添加规则
+    for proto in "${protocols[@]}"; do
+        for port in "${ports[@]}"; do
+            # 生成唯一标识（包含协议和源IP信息）
+            local unique_id="ALLOW_${port}_${proto}_${source_ip:-any}"
+            local rule_comment="comment \"${unique_id}\""
+            
+            # 构建规则
+            local rule=""
+            if [ -n "$source_ip" ] && [ "$source_ip" != "any" ]; then
+                # 指定了源IP
+                if [[ "$source_ip" =~ : ]]; then
+                    # IPv6地址
+                    rule="ip6 saddr ${source_ip} ${proto} dport ${port} accept ${rule_comment}"
+                else
+                    # IPv4地址
+                    rule="ip saddr ${source_ip} ${proto} dport ${port} accept ${rule_comment}"
+                fi
+            else
+                # 允许所有IP
+                rule="${proto} dport ${port} accept ${rule_comment}"
+            fi
+            
+            # 添加到filter表
+            if add_rule_to_file "inet script_filter" "input" "$rule"; then
+                ((success_count++))
+                if [ -n "$source_ip" ]; then
+                    echo -e "${GREEN}✓ 允许 ${proto} 端口 ${port} 来自 ${source_ip}${NC}"
+                else
+                    echo -e "${GREEN}✓ 允许所有IP访问 ${proto} 端口 ${port}${NC}"
+                fi
+            else
+                echo -e "${RED}✗ 添加 ${proto} 端口 ${port} 允许规则失败${NC}"
+            fi
+        done
+    done
+    
+    # 应用新规则
+    apply_rules_file
+    
+    echo -e "${GREEN}入站规则添加完成: ${success_count}/${total_count} 条规则成功${NC}"
 }
 
-# 拒绝入站（修复规则语法）
+# 拒绝入站（增强版，支持批量端口和all协议）
 deny_port() {
     echo -e "${YELLOW}拒绝入站${NC}"
-    echo -e "${BLUE}支持单个端口(80)或端口范围(1000-2000)${NC}"
+    echo -e "${BLUE}支持格式:${NC}"
+    echo -e "  ${GREEN}单个端口:${NC} 80"
+    echo -e "  ${GREEN}端口范围:${NC} 1000-2000"  
+    echo -e "  ${GREEN}多个端口:${NC} 80,443,1000-2000,3000"
     echo -e "${BLUE}可以指定拒绝访问的源IP，不输入则拒绝所有IP${NC}"
     echo -e "${BLUE}支持IPv4(192.168.1.1)、IPv6(2001:db8::1)和CIDR(192.168.1.0/24)格式${NC}"
     
-    read -p "请输入端口号: " port
-    read -p "请输入协议(tcp/udp, 默认tcp): " protocol
-    protocol=${protocol:-tcp}
+    read -p "请输入端口号: " port_input
+    
+    # 协议选择（增加all选项）
+    while true; do
+        read -p "请输入协议(tcp/udp/all, 默认tcp): " protocol
+        protocol=${protocol:-tcp}
+        if [[ "$protocol" == "tcp" || "$protocol" == "udp" || "$protocol" == "all" ]]; then
+            break
+        else
+            echo -e "${RED}错误: 协议必须是 tcp、udp 或 all${NC}"
+        fi
+    done
     
     # 询问源IP
     while true; do
@@ -641,100 +933,161 @@ deny_port() {
     done
     
     # 验证端口格式
-    if ! validate_port "$port"; then
+    if ! validate_port "$port_input"; then
         echo -e "${RED}错误: 端口格式不正确，请使用数字或范围(如100-200)${NC}"
+        echo -e "${YELLOW}支持的格式: 单个端口(80), 端口范围(1000-2000), 多个端口(80,443,1000-2000)${NC}"
         return 1
     fi
     
-    # 生成注释
-    local rule_comment="comment \"DENY: ${port}/${protocol} from ${source_ip:-any}\""
+    # 解析端口输入
+    local ports=()
+    parse_port_input "$port_input" ports
     
-    # 构建规则
-    local rule=""
-    if [ -n "$source_ip" ] && [ "$source_ip" != "any" ]; then
-        # 指定了源IP
-        if [[ "$source_ip" =~ : ]]; then
-            # IPv6地址
-            rule="ip6 saddr ${source_ip} ${protocol} dport ${port} drop ${rule_comment}"
-        else
-            # IPv4地址
-            rule="ip saddr ${source_ip} ${protocol} dport ${port} drop ${rule_comment}"
-        fi
-        echo -e "${GREEN}已拒绝来自 ${source_ip} 的端口访问: ${port}/${protocol}${NC}"
+    local protocols=()
+    if [ "$protocol" == "all" ]; then
+        protocols=("tcp" "udp")
+        echo -e "${BLUE}同时添加 TCP 和 UDP 协议规则${NC}"
     else
-        # 拒绝所有IP
-        rule="${protocol} dport ${port} drop ${rule_comment}"
-        echo -e "${GREEN}已拒绝所有IP访问端口: ${port}/${protocol}${NC}"
+        protocols=("$protocol")
     fi
     
-    # 添加到filter表
-    if add_rule_to_file "inet script_filter" "input" "$rule"; then
-        # 应用新规则
-        apply_rules_file
-        echo -e "${GREEN}拒绝规则已添加${NC}"
-    else
-        echo -e "${RED}添加规则失败${NC}"
-        return 1
-    fi
+    local success_count=0
+    local total_count=$(( ${#ports[@]} * ${#protocols[@]} ))
+    
+    echo -e "${BLUE}即将添加 $total_count 条拒绝规则...${NC}"
+    
+    # 添加规则
+    for proto in "${protocols[@]}"; do
+        for port in "${ports[@]}"; do
+            # 生成唯一标识（包含协议和源IP信息）
+            local unique_id="DENY_${port}_${proto}_${source_ip:-any}"
+            local rule_comment="comment \"${unique_id}\""
+            
+            # 构建规则
+            local rule=""
+            if [ -n "$source_ip" ] && [ "$source_ip" != "any" ]; then
+                # 指定了源IP
+                if [[ "$source_ip" =~ : ]]; then
+                    # IPv6地址
+                    rule="ip6 saddr ${source_ip} ${proto} dport ${port} drop ${rule_comment}"
+                else
+                    # IPv4地址
+                    rule="ip saddr ${source_ip} ${proto} dport ${port} drop ${rule_comment}"
+                fi
+            else
+                # 拒绝所有IP
+                rule="${proto} dport ${port} drop ${rule_comment}"
+            fi
+            
+            # 添加到filter表
+            if add_rule_to_file "inet script_filter" "input" "$rule"; then
+                ((success_count++))
+                if [ -n "$source_ip" ]; then
+                    echo -e "${GREEN}✓ 拒绝 ${proto} 端口 ${port} 来自 ${source_ip}${NC}"
+                else
+                    echo -e "${GREEN}✓ 拒绝所有IP访问 ${proto} 端口 ${port}${NC}"
+                fi
+            else
+                echo -e "${RED}✗ 添加 ${proto} 端口 ${port} 拒绝规则失败${NC}"
+            fi
+        done
+    done
+    
+    # 应用新规则
+    apply_rules_file
+    
+    echo -e "${GREEN}拒绝规则添加完成: ${success_count}/${total_count} 条规则成功${NC}"
 }
 
-# 删除入站规则（修复版）
+# 删除入站规则（增强版，支持批量端口和all协议）
 delete_access_rule() {
     echo -e "${YELLOW}删除入站规则${NC}"
-    echo -e "${BLUE}支持单个端口(80)或端口范围(1000-2000)${NC}"
+    echo -e "${BLUE}支持格式:${NC}"
+    echo -e "  ${GREEN}单个端口:${NC} 80"
+    echo -e "  ${GREEN}端口范围:${NC} 1000-2000"  
+    echo -e "  ${GREEN}多个端口:${NC} 80,443,1000-2000,3000"
     echo -e "${BLUE}可以指定删除特定IP的规则，不输入则删除该端口的所有规则${NC}"
     
-    read -p "请输入要删除规则的端口: " port
-    read -p "请输入协议(tcp/udp, 默认tcp): " protocol
-    protocol=${protocol:-tcp}
+    read -p "请输入要删除规则的端口: " port_input
+    
+    # 协议选择（增加all选项）
+    while true; do
+        read -p "请输入协议(tcp/udp/all, 默认tcp): " protocol
+        protocol=${protocol:-tcp}
+        if [[ "$protocol" == "tcp" || "$protocol" == "udp" || "$protocol" == "all" ]]; then
+            break
+        else
+            echo -e "${RED}错误: 协议必须是 tcp、udp 或 all${NC}"
+        fi
+    done
     
     # 询问源IP
     read -p "请输入要删除规则的源IP(不输入则删除该端口的所有规则): " source_ip
     
     # 验证端口格式
-    if ! validate_port "$port"; then
+    if ! validate_port "$port_input"; then
         echo -e "${RED}错误: 端口格式不正确，请使用数字或范围(如100-200)${NC}"
+        echo -e "${YELLOW}支持的格式: 单个端口(80), 端口范围(1000-2000), 多个端口(80,443,1000-2000)${NC}"
         return 1
     fi
     
-    echo -e "${BLUE}正在删除端口 ${port}/${protocol} 的入站规则...${NC}"
+    # 解析端口输入
+    local ports=()
+    parse_port_input "$port_input" ports
     
-    # 构建匹配模式
-    local pattern=""
-    if [ -n "$source_ip" ] && [ "$source_ip" != "any" ]; then
-        # 转义特殊字符用于正则表达式
-        local escaped_ip=$(echo "$source_ip" | sed 's/\./\\./g' | sed 's/:/\\:/g')
-        pattern="from ${escaped_ip}.*${port}"
+    local protocols=()
+    if [ "$protocol" == "all" ]; then
+        protocols=("tcp" "udp")
+        echo -e "${BLUE}同时删除 TCP 和 UDP 协议规则${NC}"
     else
-        pattern="dport ${port}"
+        protocols=("$protocol")
     fi
     
-    # 删除匹配的规则
-    if [ -f "$SCRIPT_RULES_FILE" ]; then
-        # 创建临时文件
-        local temp_file=$(mktemp)
-        
-        # 过滤掉包含目标模式的行
-        if [ -n "$pattern" ]; then
-            grep -v "$pattern" "$SCRIPT_RULES_FILE" > "$temp_file"
-        else
-            cp "$SCRIPT_RULES_FILE" "$temp_file"
-        fi
-        
-        # 替换原文件
-        mv "$temp_file" "$SCRIPT_RULES_FILE"
-        
-        # 重新应用规则
-        apply_rules_file
-        
-        if [ -n "$source_ip" ]; then
-            echo -e "${GREEN}已删除来自 ${source_ip} 的端口 ${port}/${protocol} 的入站规则${NC}"
-        else
-            echo -e "${GREEN}已删除端口 ${port}/${protocol} 的所有入站规则${NC}"
-        fi
+    echo -e "${BLUE}正在删除端口 ${port_input} 的入站规则...${NC}"
+    
+    local deleted_count=0
+    for proto in "${protocols[@]}"; do
+        for port in "${ports[@]}"; do
+            # 构建精确的匹配模式
+            local pattern=""
+            if [ -n "$source_ip" ] && [ "$source_ip" != "any" ]; then
+                # 删除特定IP和特定协议的规则
+                pattern="${port}_${proto}_${source_ip}"
+            else
+                # 删除该端口特定协议的所有规则
+                pattern="${port}_${proto}_"
+            fi
+            
+            # 删除匹配的规则（同时匹配ALLOW和DENY规则）
+            if [ -f "$SCRIPT_RULES_FILE" ]; then
+                # 创建临时文件
+                local temp_file=$(mktemp)
+                
+                # 过滤掉包含目标模式的行
+                grep -v "$pattern" "$SCRIPT_RULES_FILE" > "$temp_file"
+                
+                # 替换原文件
+                mv "$temp_file" "$SCRIPT_RULES_FILE"
+                
+                ((deleted_count++))
+                if [ -n "$source_ip" ]; then
+                    echo -e "${GREEN}✓ 删除 ${proto} 端口 ${port} 来自 ${source_ip} 的规则${NC}"
+                else
+                    echo -e "${GREEN}✓ 删除 ${proto} 端口 ${port} 的所有规则${NC}"
+                fi
+            fi
+        done
+    done
+    
+    # 清理空表并重新应用规则
+    cleanup_empty_tables
+    apply_rules_file
+    
+    echo -e "${GREEN}已删除 ${deleted_count} 条入站规则${NC}"
+    if [ "$protocol" == "all" ]; then
+        echo -e "${BLUE}注意: 删除了TCP和UDP协议的规则${NC}"
     else
-        echo -e "${RED}规则文件不存在${NC}"
-        return 1
+        echo -e "${BLUE}注意: 只删除了${protocol}协议的规则${NC}"
     fi
 }
 
