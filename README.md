@@ -19,3 +19,4 @@
 ```
 
 # 2、硬盘性能检测脚本（基于fio）
+curl -fsSL https://raw.githubusercontent.com/lyqray/tools/refs/heads/main/check_disk.sh | bash
